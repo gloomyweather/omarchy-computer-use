@@ -236,6 +236,23 @@ def _node_by_id(Atspi, win: dict, eid: str):
     return node
 
 
+def _click_center(Atspi, node, win: dict, name: str) -> str:
+    """Fallback for elements without AT-SPI actions (e.g. GTK4 sidebar rows): real pointer click
+    at the element's center, after making sure its window is the visible, focused one."""
+    comp = node.get_component_iface()
+    e = comp.get_extents(Atspi.CoordType.WINDOW) if comp is not None else None
+    if e is None or e.width <= 0 or e.height <= 0:
+        raise CUError(f"{name!r} has no actions and no on-screen box")
+    if not win.get("visible") or not win.get("focused"):
+        core.focus_window(win["address"])
+        win = core.find_window(win["address"])
+    S = core.scale_factor()
+    wx, wy = win["box"][0] / S, win["box"][1] / S
+    cx, cy = core.to_screen(wx + e.x + e.width / 2, wy + e.y + e.height / 2, S)
+    core.click(cx, cy)
+    return f"clicked {name!r} at ({cx}, {cy}) (no AT-SPI action; used the pointer)"
+
+
 def act(eid: str, action: str = "click", text: str | None = None, window: str | None = None) -> str:
     if window is None:
         import json
@@ -265,7 +282,9 @@ def act(eid: str, action: str = "click", text: str | None = None, window: str | 
         return f"set text of {name!r}"
     ai = node.get_action_iface()
     if ai is None or ai.get_n_actions() == 0:
-        raise CUError(f"{name!r} has no actions; click its center coordinates instead")
+        if action != "click":
+            raise CUError(f"{name!r} exposes no actions")
+        return _click_center(Atspi, node, win, name)
     names = [ai.get_action_name(k) for k in range(ai.get_n_actions())]
     if action == "click":
         pref = ("click", "press", "activate", "toggle", "jump", "open")
