@@ -1,0 +1,12 @@
+{
+  "name": "omarchy-computer-use",
+  "description": "Computer use for Claude Code on Omarchy / Hyprland",
+  "owner": { "name": "gloomyweather", "email": "228333338+gloomyweather@users.noreply.github.com" },
+  "plugins": [
+    {
+      "name": "omarchy-computer-use",
+      "source": "./",
+      "description": "Screenshots, mouse, keyboard, OCR clicks and window control for Omarchy / Hyprland via a local MCP server + skill."
+    }
+  ]
+}
