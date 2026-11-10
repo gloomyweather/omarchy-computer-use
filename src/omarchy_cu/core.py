@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -54,8 +55,134 @@ def run(cmd: list[str], *, input: bytes | None = None, timeout: float = 20, chec
 
 
 def check_not_paused() -> None:
+    """Called before every input action: enforces the kill switch and lights the indicator."""
     if PAUSE_FILE.exists():
-        raise CUError("computer use is paused by the user (run `omarchy-cu resume` to allow input again)")
+        raise CUError("computer use is PAUSED by the user (kill switch). Stop and ask the user; "
+                      "they can resume with `omarchy-cu resume` or by clicking the on-screen pill.")
+    mark_activity()
+
+
+# --------------------------------------------------------------- self-protection
+
+def _ancestor_pids() -> set[int]:
+    """PIDs of this process and all its ancestors (agent CLI, shell, terminal emulator...)."""
+    out, pid = set(), os.getpid()
+    for _ in range(64):
+        out.add(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        if ppid <= 1:
+            break
+        pid = ppid
+    return out
+
+
+def own_window_address() -> str | None:
+    """Address of the window that hosts this agent (e.g. the terminal running Claude Code)."""
+    anc = _ancestor_pids()
+    try:
+        for c in Hypr.j("clients"):
+            if c.get("pid") in anc:
+                return c["address"]
+    except Exception:
+        pass
+    return None
+
+
+def guard_keyboard_target() -> None:
+    """Refuse to type into the agent's own terminal: a stray Escape / ctrl+c / Enter there would
+    interrupt or drive the agent itself. Override with OMARCHY_CU_ALLOW_SELF=1."""
+    if os.environ.get("OMARCHY_CU_ALLOW_SELF") == "1":
+        return
+    try:
+        active = Hypr.j("activewindow") or {}
+    except Exception:
+        return
+    if active.get("pid") and active.get("pid") in _ancestor_pids():
+        if _interactive_layer_open():
+            return  # a menu / launcher layer has keyboard focus, not the terminal
+        raise CUError(f"the focused window [{active.get('class')}] {active.get('title', '')!r} is the agent's own "
+                      "terminal; keyboard input there would hit the agent itself. Focus the target window first "
+                      "(focus_window / click into it), then retry.")
+
+
+PASSIVE_LAYERS = re.compile(r"^(omarchy-(background|bar|dock|notifications|osd)|omarchy-cu-.*|wallpaper|hyprpaper|swaybg|"
+                            r"waybar|mako|swaync.*|notifications|gtk-layer-shell|hyprpicker|selection)$")
+
+
+def _interactive_layer_open() -> bool:
+    try:
+        data = Hypr.j("layers")
+    except Exception:
+        return False
+    for mon in data.values():
+        for level in ("2", "3"):  # top, overlay
+            for l in mon.get("levels", {}).get(level, []):
+                if not PASSIVE_LAYERS.match(l.get("namespace", "")):
+                    return True
+    return False
+
+
+# ------------------------------------------------------------------- indicator
+
+ACTIVITY_FILE = CACHE / "activity"
+HIDE_SENT = CACHE / "overlay.hide-sent"
+INDICATOR = os.environ.get("OMARCHY_CU_INDICATOR", "1") not in ("0", "false", "no")
+LAYER_SHELL_LIB = "/usr/lib/libgtk4-layer-shell.so"
+
+
+def _overlay_pid() -> int | None:
+    try:
+        pid = int((CACHE / "overlay.pid").read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def ensure_overlay() -> None:
+    if not INDICATOR or _overlay_pid() or not Path(LAYER_SHELL_LIB).exists():
+        return
+    py = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else (shutil.which("python3") or "python3")
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = LAYER_SHELL_LIB + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+    try:
+        subprocess.Popen([py, "-I", str(Path(__file__).with_name("overlay.py"))], env=env,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True)
+    except OSError:
+        pass
+
+
+def mark_activity() -> None:
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        ACTIVITY_FILE.touch()
+    except OSError:
+        return
+    ensure_overlay()
+
+
+def hide_overlay_for_capture() -> None:
+    """Make sure the indicator is not in the captured pixels. The overlay hides its content on
+    SIGUSR1 and keeps it hidden ~1.5 s after the last request; Hyprland needs ~0.2 s to drop it."""
+    pid = _overlay_pid()
+    if not pid:
+        return
+    try:
+        recently = time.time() - HIDE_SENT.stat().st_mtime < 1.2
+    except OSError:
+        recently = False
+    try:
+        os.kill(pid, signal.SIGUSR1)
+        HIDE_SENT.touch()
+    except OSError:
+        return
+    if not recently:
+        time.sleep(float(os.environ.get("OMARCHY_CU_HIDE_DELAY", "0.25")))
 
 
 # ------------------------------------------------------------------------- hyprland
@@ -210,6 +337,7 @@ def png_size(b: bytes) -> tuple[int, int]:
 
 
 def _grim(geom: str | None, output: str | None, scale: float, cursor: bool) -> bytes:
+    hide_overlay_for_capture()
     cmd = ["grim", "-s", f"{scale:.6f}", "-l", "3"]
     if cursor:
         cmd.append("-c")
@@ -283,8 +411,167 @@ def _ocr_langs() -> str:
     return "+".join(langs or ["eng"])
 
 
+def _tess_words(img: Path, langs: str) -> list[tuple]:
+    tsv = run(["tesseract", str(img), "-", "-l", langs, "--psm", "11", "tsv"], timeout=60).decode(errors="replace")
+    out = []
+    for row in csv.DictReader(io.StringIO(tsv), delimiter="\t", quoting=csv.QUOTE_NONE):
+        t = (row.get("text") or "").strip()
+        try:
+            conf = float(row.get("conf", -1))
+        except (TypeError, ValueError):
+            continue
+        if not t or conf < 35:
+            continue
+        out.append((t, int(row["left"]), int(row["top"]), int(row["width"]), int(row["height"]), conf))
+    return out
+
+
+def _overlap(a: tuple, b: tuple) -> float:
+    ax0, ay0, ax1, ay1 = a[1], a[2], a[1] + a[3], a[2] + a[4]
+    bx0, by0, bx1, by1 = b[1], b[2], b[1] + b[3], b[2] + b[4]
+    iw, ih = min(ax1, bx1) - max(ax0, bx0), min(ay1, by1) - max(ay0, by0)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    return iw * ih / max(1, min(a[3] * a[4], b[3] * b[4]))
+
+
+def _ocr_words(png: bytes) -> tuple[list[tuple], int]:
+    """Two OCR passes run in parallel and merged: (A) upscaled original, (B) grayscale,
+    polarity-normalised (dark themes inverted) and binarised — B catches colored links /
+    low-contrast text that A drops. Returns words in image px of the *upscaled* image + factor."""
+    langs = _ocr_langs()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "s.png"
+        src.write_bytes(png)
+        iw, ih = png_size(png)
+        up = 2 if max(iw, ih) <= 2600 else 1
+        if not shutil.which("magick"):
+            return _tess_words(src, langs), 1
+        a, b = Path(td) / "a.png", Path(td) / "b.png"
+        mean = float(run(["magick", str(src), "-colorspace", "gray", "-format", "%[fx:mean]", "info:"], timeout=20) or 0.5)
+        run(["magick", str(src), "-resize", f"{up * 100}%", str(a)], timeout=30)
+        run(["magick", str(src), "-colorspace", "gray", *(["-negate"] if mean < 0.5 else []),
+             "-resize", f"{up * 100}%", "-threshold", "55%", str(b)], timeout=30)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(2) as ex:
+            wa, wb = ex.map(lambda p: _tess_words(p, langs), (a, b))
+    words = list(wa)
+    for w in wb:
+        if all(_overlap(w, x) < 0.3 for x in words):
+            words.append(w)
+    return words, up
+
+
+def _rows(words: list[tuple]) -> list[list[tuple]]:
+    """Cluster words into visual text runs: same row (vertical overlap) and small horizontal gaps."""
+    words = sorted(words, key=lambda w: (w[2] + w[4] / 2, w[1]))
+    rows: list[list[tuple]] = []
+    for w in words:
+        cy = w[2] + w[4] / 2
+        for r in rows:
+            ry0 = min(x[2] for x in r); ry1 = max(x[2] + x[4] for x in r)
+            if ry0 <= cy <= ry1 and abs((ry1 - ry0) - w[4]) < max(w[4], ry1 - ry0) * 0.8:
+                r.append(w)
+                break
+        else:
+            rows.append([w])
+    out = []
+    for r in rows:
+        r.sort(key=lambda w: w[1])
+        cur = [r[0]]
+        for w in r[1:]:
+            prev = cur[-1]
+            if w[1] - (prev[1] + prev[3]) > 1.6 * max(prev[4], w[4]):
+                out.append(cur); cur = [w]
+            else:
+                cur.append(w)
+        out.append(cur)
+    return out
+
+
+def _tess_words(img: Path, langs: str) -> list[tuple]:
+    tsv = run(["tesseract", str(img), "-", "-l", langs, "--psm", "11", "tsv"], timeout=60).decode(errors="replace")
+    out = []
+    for row in csv.DictReader(io.StringIO(tsv), delimiter="\t", quoting=csv.QUOTE_NONE):
+        t = (row.get("text") or "").strip()
+        try:
+            conf = float(row.get("conf", -1))
+        except (TypeError, ValueError):
+            continue
+        if not t or conf < 35:
+            continue
+        out.append((t, int(row["left"]), int(row["top"]), int(row["width"]), int(row["height"]), conf))
+    return out
+
+
+def _overlap(a: tuple, b: tuple) -> float:
+    ax0, ay0, ax1, ay1 = a[1], a[2], a[1] + a[3], a[2] + a[4]
+    bx0, by0, bx1, by1 = b[1], b[2], b[1] + b[3], b[2] + b[4]
+    iw, ih = min(ax1, bx1) - max(ax0, bx0), min(ay1, by1) - max(ay0, by0)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    return iw * ih / max(1, min(a[3] * a[4], b[3] * b[4]))
+
+
+def _ocr_words(png: bytes) -> tuple[list[tuple], int]:
+    """Two OCR passes run in parallel and merged: (A) upscaled original, (B) grayscale,
+    polarity-normalised (dark themes inverted) and binarised. B catches colored links and
+    low-contrast text that A drops. Returns words in px of the upscaled image + the factor."""
+    langs = _ocr_langs()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "s.png"
+        src.write_bytes(png)
+        iw, ih = png_size(png)
+        if not shutil.which("magick"):
+            return _tess_words(src, langs), 1
+        up = 2 if max(iw, ih) <= 2600 else 1
+        a, b = Path(td) / "a.png", Path(td) / "b.png"
+        try:
+            mean = float(run(["magick", str(src), "-colorspace", "gray", "-format", "%[fx:mean]", "info:"], timeout=20) or 0.5)
+        except ValueError:
+            mean = 0.5
+        run(["magick", str(src), "-resize", f"{up * 100}%", str(a)], timeout=30)
+        run(["magick", str(src), "-colorspace", "gray", *(["-negate"] if mean < 0.5 else []),
+             "-resize", f"{up * 100}%", "-threshold", "55%", str(b)], timeout=30)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(2) as ex:
+            wa, wb = ex.map(lambda p: _tess_words(p, langs), (a, b))
+    words = list(wa)
+    for w in wb:
+        if all(_overlap(w, x) < 0.3 for x in words):
+            words.append(w)
+    return words, up
+
+
+def _rows(words: list[tuple]) -> list[list[tuple]]:
+    """Cluster words into visual text runs: same row (vertical overlap) and small horizontal gaps."""
+    words = sorted(words, key=lambda w: (w[2] + w[4] / 2, w[1]))
+    rows: list[list] = []  # [y0, y1, words]
+    for w in words:
+        cy = w[2] + w[4] / 2
+        for r in rows:
+            if r[0] <= cy <= r[1] and 0.5 < w[4] / max(1, r[1] - r[0]) < 2.0:
+                r[2].append(w)
+                r[0] = min(r[0], w[2]); r[1] = max(r[1], w[2] + w[4])
+                break
+        else:
+            rows.append([w[2], w[2] + w[4], [w]])
+    out = []
+    for _, _, r in rows:
+        r.sort(key=lambda w: w[1])
+        cur = [r[0]]
+        for w in r[1:]:
+            prev = cur[-1]
+            if w[1] - (prev[1] + prev[3]) > 1.6 * max(prev[4], w[4]):
+                out.append(cur); cur = [w]
+            else:
+                cur.append(w)
+        out.append(cur)
+    return out
+
+
 def ocr_lines(region: tuple[float, float, float, float] | None = None, monitor: str | None = None) -> list[TextHit]:
-    """OCR the screen (native resolution for accuracy); returns one hit per text line."""
+    """OCR the screen at native resolution; returns one hit per visual text run."""
     mons = monitors()
     S = scale_factor(mons)
     native = max(m.scale for m in mons)
@@ -293,64 +580,28 @@ def ocr_lines(region: tuple[float, float, float, float] | None = None, monitor: 
         lx, ly = to_logical(x, y, S)
         lw, lh = max(1, round(w / S)), max(1, round(h / S))
         png = _grim(f"{lx},{ly} {lw}x{lh}", None, native, False)
-        org_l = (lx, ly)
+        org_l, span_l = (lx, ly), lw
     else:
         m = pick_monitor(monitor, mons)
         if m is None:
             png = _grim(None, None, native, False)
             org_l = (min(mm.x for mm in mons), min(mm.y for mm in mons))
+            span_l = max(mm.x + mm.w for mm in mons) - org_l[0]
         else:
             png = _grim(None, m.name, native, False)
-            org_l = (m.x, m.y)
+            org_l, span_l = (m.x, m.y), m.w
     iw, _ = png_size(png)
-    # image px -> logical: depends on what grim produced
-    lw_total = (lw if region else (m.w if m else (max(mm.x + mm.w for mm in mons) - org_l[0])))
-    k = lw_total / iw  # logical px per image px
-    # upscale small UI text for tesseract
-    upscale = 2 if native < 1.5 else 1
-    with tempfile.TemporaryDirectory() as td:
-        src = Path(td) / "s.png"
-        src.write_bytes(png)
-        if upscale > 1 and shutil.which("magick"):
-            run(["magick", str(src), "-resize", f"{upscale * 100}%", str(src)], timeout=30)
-        else:
-            upscale = 1
-        tsv = run(["tesseract", str(src), "-", "-l", _ocr_langs(), "--psm", "11", "tsv"],
-                  timeout=60).decode(errors="replace")
-    words: dict[tuple, list] = {}
-    for row in csv.DictReader(io.StringIO(tsv), delimiter="\t", quoting=csv.QUOTE_NONE):
-        t = (row.get("text") or "").strip()
-        try:
-            conf = float(row.get("conf", -1))
-        except ValueError:
-            continue
-        if not t or conf < 30:
-            continue
-        key = (row["block_num"], row["par_num"], row["line_num"])
-        words.setdefault(key, []).append((t, int(row["left"]), int(row["top"]), int(row["width"]), int(row["height"]), conf))
+    words, up = _ocr_words(png)
+    f = span_l / iw / up * S  # upscaled-image px -> screen px
     hits = []
-    for ws in words.values():
-        ws.sort(key=lambda w: w[1])
-        # split a tesseract "line" on big horizontal gaps (separate UI elements)
-        groups, cur = [], [ws[0]]
-        for w in ws[1:]:
-            prev = cur[-1]
-            gap = w[1] - (prev[1] + prev[3])
-            if gap > 2.2 * max(prev[4], w[4]):
-                groups.append(cur)
-                cur = [w]
-            else:
-                cur.append(w)
-        groups.append(cur)
-        for g in groups:
-            x0 = min(w[1] for w in g); y0 = min(w[2] for w in g)
-            x1 = max(w[1] + w[3] for w in g); y1 = max(w[2] + w[4] for w in g)
-            f = k / upscale * S
-            bx, by = org_l[0] * S + x0 * f, org_l[1] * S + y0 * f
-            bw, bh = (x1 - x0) * f, (y1 - y0) * f
-            hits.append(TextHit(" ".join(w[0] for w in g), round(bx + bw / 2), round(by + bh / 2),
-                                (round(bx), round(by), round(bw), round(bh)),
-                                round(sum(w[5] for w in g) / len(g), 1)))
+    for g in _rows(words):
+        x0 = min(w[1] for w in g); y0 = min(w[2] for w in g)
+        x1 = max(w[1] + w[3] for w in g); y1 = max(w[2] + w[4] for w in g)
+        bx, by = org_l[0] * S + x0 * f, org_l[1] * S + y0 * f
+        bw, bh = (x1 - x0) * f, (y1 - y0) * f
+        hits.append(TextHit(" ".join(w[0] for w in g), round(bx + bw / 2), round(by + bh / 2),
+                            (round(bx), round(by), round(bw), round(bh)),
+                            round(sum(w[5] for w in g) / len(g), 1)))
     hits.sort(key=lambda h: (h.box[1] // 8, h.box[0]))
     return hits
 
@@ -524,21 +775,29 @@ def parse_combo(combo: str) -> tuple[list[str], str]:
 def key(combo: str, repeat: int = 1) -> None:
     """Press a key combo like 'ctrl+shift+t', 'super+Return', 'Escape', 'alt+F4'. Space-separate
     several combos to press them in sequence: 'ctrl+a Delete'."""
+    seq0 = combo.split() if " " in combo.strip() and combo.strip() != " " else [combo]
+    # super+... combos are compositor shortcuts (Hyprland binds), safe even over the agent's terminal
+    if not all("logo" in parse_combo(c)[0] for c in seq0):
+        guard_keyboard_target()
     seq = combo.split() if " " in combo.strip() and combo.strip() != " " else [combo]
     args: list[str] = []
     for _ in range(max(1, int(repeat))):
         for c in seq:
             mods, k = parse_combo(c)
-            for m in mods:
-                args += ["-M", m]
+            # modifiers are sent as modifier state (-M/-m), never as real Shift_L/Alt_L key presses:
+            # those would trip xkb layout-switch options like grp:alt_shift_toggle.
+            press = [("-M", m, "-m") for m in mods]
+            for on, sym, _off in press:
+                args += [on, sym]
             args += ["-k", k]
-            for m in reversed(mods):
-                args += ["-m", m]
+            for _on, sym, off in reversed(press):
+                args += [off, sym]
             args += ["-s", "20"]
     _wtype(*args)
 
 
 def type_text(text: str, delay_ms: int = 4, via_clipboard: bool = False) -> None:
+    guard_keyboard_target()
     if via_clipboard:
         old = None
         try:
@@ -667,6 +926,11 @@ def hyprctl(args: str) -> str:
     if not hc:
         raise CUError("hyprctl not found")
     import shlex
+    stripped = args.strip()
+    if stripped.startswith("dispatch "):
+        # send verbatim over the socket: hyprctl's argv joining would strip lua string quotes
+        check_not_paused()
+        return Hypr.request("/dispatch " + stripped[len("dispatch "):].strip())
     parts = shlex.split(args)
     if parts and parts[0] in ("dispatch", "keyword", "eval", "reload", "kill", "setcursor", "switchxkblayout", "output"):
         check_not_paused()
@@ -683,9 +947,11 @@ def desktop_summary() -> str:
     for i, m in enumerate(mons):
         ox, oy = to_screen(m.x, m.y, S)
         lines.append(f"monitor {i} {m.name}{' [focused]' if m.focused else ''}: box=({ox},{oy},{round(m.w * S)},{round(m.h * S)}) workspace={m.workspace}")
+    own = own_window_address()
     for w in windows(all_workspaces=False):
         flag = "*" if w["focused"] else " "
-        lines.append(f"{flag} window {w['address']} [{w['class']}] {w['title'][:80]!r} box={tuple(w['box'])}")
+        me = "  <- agent's own terminal (don't type here)" if w["address"] == own else ""
+        lines.append(f"{flag} window {w['address']} [{w['class']}] {w['title'][:80]!r} box={tuple(w['box'])}{me}")
     return "\n".join(lines)
 
 
@@ -725,3 +991,238 @@ def keybindings(filter: str = "") -> list[str]:
         if not f or f in line.lower():
             out.append(line)
     return out
+
+
+# ------------------------------------------------------------- window management
+
+def _target(sel: str | None) -> tuple[str, str]:
+    """(lua `window = ...` fragment, legacy `address:...` selector) for a window selector."""
+    if not sel:
+        return "", ""
+    a = find_window(sel)["address"]
+    return f', window = "address:{a}"', f"address:{a}"
+
+
+def window_action(action: str, window: str | None = None, workspace: str | None = None,
+                  x: float | None = None, y: float | None = None,
+                  width: float | None = None, height: float | None = None,
+                  direction: str | None = None) -> str:
+    """Hyprland window management. Coordinates/sizes are in screen space."""
+    check_not_paused()
+    lw, lg = _target(window)
+    lw0 = lw[2:] if lw else ""  # without leading ', '
+    S = scale_factor()
+    act = action.lower()
+    if act in ("float", "toggle_float", "tile"):
+        mode = {"float": "on", "tile": "off"}.get(act, "toggle")
+        legacy = {"on": "setfloating", "off": "settiled", "toggle": "togglefloating"}[mode]
+        Hypr.dispatch(f'hl.dsp.window.float({{ action = "{mode}"{lw} }})', f"{legacy} {lg}".strip())
+    elif act in ("fullscreen", "maximize"):
+        mode = "fullscreen" if act == "fullscreen" else "maximized"
+        Hypr.dispatch(f'hl.dsp.window.fullscreen({{ mode = "{mode}", action = "toggle"{lw} }})',
+                      f"fullscreen {0 if mode == 'fullscreen' else 1}")
+    elif act in ("move_to_workspace", "send_to_workspace"):
+        if not workspace:
+            raise CUError("workspace is required")
+        follow = "true" if act == "move_to_workspace" else "false"
+        legacy = "movetoworkspace" if act == "move_to_workspace" else "movetoworkspacesilent"
+        Hypr.dispatch(f'hl.dsp.window.move({{ workspace = {lua_str(str(workspace))}, follow = {follow}{lw} }})',
+                      f"{legacy} {workspace}" + (f",{lg}" if lg else ""))
+    elif act == "move":
+        if x is None or y is None:
+            raise CUError("x and y are required (screen space, top-left of the window)")
+        lx, ly = to_logical(x, y, S)
+        Hypr.dispatch(f'hl.dsp.window.move({{ x = {lx}, y = {ly}{lw} }})',
+                      f"movewindowpixel exact {lx} {ly}" + (f",{lg}" if lg else ""))
+    elif act == "resize":
+        if width is None or height is None:
+            raise CUError("width and height are required (screen space)")
+        lx, ly = round(width / S), round(height / S)
+        Hypr.dispatch(f'hl.dsp.window.resize({{ x = {lx}, y = {ly}{lw} }})',
+                      f"resizewindowpixel exact {lx} {ly}" + (f",{lg}" if lg else ""))
+    elif act in ("swap", "move_direction", "focus_direction"):
+        d = (direction or "").lower()[:1]
+        if d not in ("l", "r", "u", "d"):
+            raise CUError("direction must be left/right/up/down")
+        if act == "focus_direction":
+            Hypr.dispatch(f'hl.dsp.focus({{ direction = "{d}" }})', f"movefocus {d}")
+        elif act == "swap":
+            Hypr.dispatch(f'hl.dsp.window.swap({{ direction = "{d}" }})', f"swapwindow {d}")
+        else:
+            Hypr.dispatch(f'hl.dsp.window.move({{ direction = "{d}" }})', f"movewindow {d}")
+    elif act == "pin":
+        Hypr.dispatch(f"hl.dsp.window.pin({{ {lw0} }})" if lw0 else "hl.dsp.window.pin()", f"pin {lg}".strip())
+    elif act == "close":
+        close_window(window)
+    elif act == "focus":
+        focus_window(window or "")
+    else:
+        raise CUError("action must be one of: focus, close, float, tile, toggle_float, fullscreen, maximize, "
+                      "move_to_workspace, send_to_workspace, move, resize, swap, move_direction, focus_direction, pin")
+    time.sleep(0.15)
+    return f"{action} ok"
+
+
+# ------------------------------------------------------------------ apps (.desktop)
+
+def apps(query: str = "") -> list[dict]:
+    """Installed desktop applications (name, desktop id, comment), filtered by query."""
+    dirs = [Path.home() / ".local/share/applications"]
+    for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
+        dirs.append(Path(d) / "applications")
+    seen, out = set(), []
+    q = query.lower().strip()
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.rglob("*.desktop")):
+            did = str(f.relative_to(d)).replace("/", "-")
+            if did in seen:
+                continue
+            seen.add(did)
+            info, in_entry = {}, False
+            try:
+                for line in f.read_text(errors="replace").splitlines():
+                    if line.startswith("["):
+                        in_entry = line.strip() == "[Desktop Entry]"
+                        continue
+                    if in_entry and "=" in line:
+                        k, v = line.split("=", 1)
+                        info.setdefault(k.strip(), v.strip())
+            except OSError:
+                continue
+            if info.get("NoDisplay") == "true" or info.get("Hidden") == "true" or info.get("Type", "Application") != "Application":
+                continue
+            item = {"name": info.get("Name", did), "id": did, "comment": info.get("Comment", "")[:80]}
+            hay = f"{item['name']} {did} {item['comment']} {info.get('Keywords', '')} {info.get('GenericName', '')}".lower()
+            if not q or q in hay:
+                out.append(item)
+    return out
+
+
+def launch_app(name: str, wait_for_window: float = 8.0) -> dict | None:
+    """Launch an installed app by name or desktop id (fuzzy), like the app launcher does."""
+    cands = apps(name)
+    if not cands:
+        raise CUError(f"no installed app matches {name!r} (see `apps`)")
+    low = name.lower()
+    cands.sort(key=lambda a: (a["name"].lower() != low, a["id"].lower() != f"{low}.desktop",
+                              not a["name"].lower().startswith(low), len(a["name"])))
+    did = cands[0]["id"]
+    if shutil.which("uwsm-app"):
+        cmd = f"uwsm-app -- {did}"
+    elif shutil.which("gtk-launch"):
+        cmd = f"gtk-launch {did[:-8] if did.endswith('.desktop') else did}"
+    else:
+        raise CUError("need uwsm-app or gtk-launch to start desktop apps")
+    return launch(cmd, wait_for_window)
+
+
+# ---------------------------------------------------------------- omarchy native
+
+def omarchy(args: str, timeout: float = 60) -> str:
+    """Run the Omarchy command center: `omarchy <args>` (theme, font, audio, brightness, wifi,
+    bluetooth, screenshot, notification, menu, toggle, ...)."""
+    import shlex
+    exe = shutil.which("omarchy")
+    if not exe:
+        raise CUError("`omarchy` command not found (not an Omarchy system?)")
+    parts = shlex.split(args)
+    if parts and parts[0] not in ("commands", "--help", "-h", "help") and "--help" not in parts:
+        check_not_paused()
+    p = subprocess.run([exe, *parts], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    out = (p.stdout + (("\n" + p.stderr) if p.stderr.strip() else "")).strip()
+    if p.returncode != 0:
+        raise CUError(f"omarchy {args} exited {p.returncode}: {out[-2000:]}")
+    return out or "ok"
+
+
+def omarchy_commands(query: str = "") -> list[str]:
+    exe = shutil.which("omarchy")
+    if not exe:
+        raise CUError("`omarchy` command not found")
+    data = json.loads(run([exe, "commands", "--json"], timeout=20))
+    q = query.lower().strip()
+    out = []
+    for c in data.get("commands", []):
+        if c.get("hidden"):
+            continue
+        line = f"{c['route']} {c.get('args', '')}".strip()
+        line += f"  — {c.get('summary', '')}" + (" [sudo]" if c.get("requires_sudo") else "")
+        if not q or all(w in line.lower() for w in q.split()):
+            out.append(line)
+    return out
+
+
+def notify(title: str, body: str = "", urgency: str = "normal", timeout_ms: int = 6000) -> None:
+    """Desktop notification to the user (Omarchy notification center, fallback notify-send)."""
+    exe = shutil.which("omarchy-notification-send")
+    if exe:
+        cmd = [exe, "--app-name", _agent_label(), "-u", urgency, "-t", str(timeout_ms), title] + ([body] if body else [])
+    elif shutil.which("notify-send"):
+        cmd = ["notify-send", "-a", _agent_label(), "-u", urgency, "-t", str(timeout_ms), title] + ([body] if body else [])
+    else:
+        raise CUError("no notification tool found")
+    run(cmd, timeout=10, check=False)
+
+
+def _agent_label() -> str:
+    n = os.environ.get("OMARCHY_CU_AGENT_NAME")
+    if n:
+        return n
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return "Claude"
+    return "AI agent"
+
+
+def ask_user(question: str, options: list[str] | None = None, timeout: float = 300) -> str | None:
+    """Ask the user via a native Omarchy menu popup: pick one of `options`, or free text if none.
+    Returns the answer, or None if dismissed / timed out."""
+    sel, inp = shutil.which("omarchy-menu-select"), shutil.which("omarchy-menu-input")
+    title = f"{_agent_label()}: {question}"
+    if options:
+        if sel:
+            cmd = [sel, title, *options]
+        elif shutil.which("walker"):
+            cmd = ["walker", "--dmenu", "-p", title]
+        else:
+            raise CUError("no menu tool (omarchy-menu-select / walker) available")
+    else:
+        if inp:
+            cmd = [inp, title]
+        elif shutil.which("walker"):
+            cmd = ["walker", "--dmenu", "-p", title]
+        else:
+            raise CUError("no input tool (omarchy-menu-input / walker) available")
+    try:
+        p = subprocess.run(cmd, input=("\n".join(options or [])) if cmd[0].endswith("walker") else None,
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    ans = p.stdout.strip()
+    return ans if p.returncode == 0 and ans else None
+
+
+# --------------------------------------------------------------------- waiting
+
+def wait_for(text: str | None = None, window: str | None = None, gone: bool = False,
+             timeout: float = 15, interval: float = 0.7) -> dict:
+    """Poll until on-screen text (OCR) or a window (class/title) appears — or disappears if gone."""
+    if not text and not window:
+        raise CUError("give text or window")
+    t0 = time.time()
+    while True:
+        found = None
+        if window:
+            try:
+                found = find_window(window)
+            except CUError:
+                found = None
+        else:
+            hits = find_text(text)
+            found = hits[0].__dict__ if hits else None
+        if bool(found) != gone:
+            return {"ok": True, "seconds": round(time.time() - t0, 1), "match": found}
+        if time.time() - t0 > timeout:
+            return {"ok": False, "seconds": round(time.time() - t0, 1), "match": None}
+        time.sleep(interval)

@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 
-from . import core
+from . import a11y, core
 from .core import CUError
 
 HELP = """\
@@ -99,6 +99,30 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("clipboard", help="print clipboard, or set it"); s.add_argument("text", nargs="?")
     s = sub.add_parser("hyprctl", help="raw hyprctl passthrough"); s.add_argument("args", nargs=argparse.REMAINDER)
     s = sub.add_parser("wait", help="sleep seconds"); s.add_argument("seconds", type=float)
+
+    s = sub.add_parser("ui", help="accessibility tree of a window (AT-SPI)")
+    s.add_argument("query", nargs="?", default=""); s.add_argument("--window"); s.add_argument("--all", action="store_true")
+    s.add_argument("--limit", type=int, default=250); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("ui-do", help="act on a ui element id: click|focus|set_text|<action>")
+    s.add_argument("id"); s.add_argument("action", nargs="?", default="click"); s.add_argument("--text"); s.add_argument("--window")
+    s = sub.add_parser("window", help="window action: float|tile|fullscreen|maximize|move_to_workspace|send_to_workspace|move|resize|swap|pin|close|focus")
+    s.add_argument("action"); s.add_argument("--window"); s.add_argument("--workspace")
+    s.add_argument("--x", type=float); s.add_argument("--y", type=float); s.add_argument("--width", type=float); s.add_argument("--height", type=float)
+    s.add_argument("--direction", choices=["left", "right", "up", "down"])
+    s = sub.add_parser("apps", help="search installed desktop apps"); s.add_argument("query", nargs="?", default="")
+    s = sub.add_parser("open", help="launch an installed app by name (like the launcher)")
+    s.add_argument("app"); s.add_argument("--wait", type=float, default=8)
+    s = sub.add_parser("omarchy", help="run `omarchy <args>`"); s.add_argument("args", nargs=argparse.REMAINDER)
+    s = sub.add_parser("commands", help="search the omarchy command catalog"); s.add_argument("query", nargs="?", default="")
+    s = sub.add_parser("notify", help="desktop notification"); s.add_argument("title"); s.add_argument("body", nargs="?", default="")
+    s.add_argument("--urgency", default="normal", choices=["low", "normal", "critical"])
+    s = sub.add_parser("ask", help="ask the user via a native popup; prints the answer (exit 1 if dismissed)")
+    s.add_argument("question"); s.add_argument("options", nargs="*"); s.add_argument("--timeout", type=float, default=300)
+    s = sub.add_parser("wait-for", help="wait for text (OCR) or --window to appear (or --gone)")
+    s.add_argument("text", nargs="?"); s.add_argument("--window"); s.add_argument("--gone", action="store_true")
+    s.add_argument("--timeout", type=float, default=15)
+    s = sub.add_parser("indicator", help="on-screen 'agent is using your computer' indicator: show|hide|status")
+    s.add_argument("what", choices=["show", "hide", "status"])
 
     sub.add_parser("pause", help="block all agent input (kill switch)")
     sub.add_parser("resume", help="allow agent input again")
@@ -197,11 +221,57 @@ def _run(a) -> int:
         print(core.hyprctl(" ".join(a.args)), end=""); return 0
     if c == "wait":
         time.sleep(a.seconds); return 0
+    if c == "ui":
+        res = a11y.tree(a.window, a.query, not a.all, a.limit)
+        if a.json:
+            print(json.dumps(res, ensure_ascii=False, indent=1)); return 0
+        for e in res["elements"]:
+            ctr = f"{e['center'][0]}\t{e['center'][1]}" if e.get("center") else "-\t-"
+            extra = " ".join(filter(None, [",".join(e.get("states", [])), f"value={e['value']!r}" if e.get("value") else "",
+                                           "/".join(e.get("actions", []))]))
+            print(f"{e['id']}\t{ctr}\t{e['role']}\t{e['name']}\t{extra}".rstrip())
+        if res.get("note"):
+            print(f"# {res['note']}", file=sys.stderr)
+        return 0 if res["elements"] else 1
+    if c == "ui-do":
+        print(a11y.act(a.id, a.action, a.text, a.window)); return 0
+    if c == "window":
+        print(core.window_action(a.action, a.window, a.workspace, a.x, a.y, a.width, a.height, a.direction)); return 0
+    if c == "apps":
+        for i in core.apps(a.query):
+            print(f"{i['name']}\t{i['id']}\t{i['comment']}")
+        return 0
+    if c == "open":
+        w = core.launch_app(a.app, a.wait)
+        print(json.dumps(w, ensure_ascii=False) if w else "launched (no new window seen)"); return 0
+    if c == "omarchy":
+        print(core.omarchy(" ".join(__import__("shlex").quote(x) for x in a.args))); return 0
+    if c == "commands":
+        print("\n".join(core.omarchy_commands(a.query))); return 0
+    if c == "notify":
+        core.notify(a.title, a.body, a.urgency); return 0
+    if c == "ask":
+        ans = core.ask_user(a.question, a.options or None, a.timeout)
+        if ans is None:
+            return 1
+        print(ans); return 0
+    if c == "wait-for":
+        r = core.wait_for(a.text, a.window, a.gone, a.timeout)
+        print(json.dumps(r, ensure_ascii=False, default=str)); return 0 if r["ok"] else 1
+    if c == "indicator":
+        if a.what == "show":
+            core.mark_activity()
+        elif a.what == "hide":
+            pid = core._overlay_pid()
+            if pid:
+                import os, signal
+                os.kill(pid, signal.SIGTERM)
+        print("running" if core._overlay_pid() else "not running"); return 0
     if c == "pause" or (c == "toggle" and not core.PAUSE_FILE.exists()):
-        core.CACHE.mkdir(parents=True, exist_ok=True); core.PAUSE_FILE.touch()
+        core.CACHE.mkdir(parents=True, exist_ok=True); core.PAUSE_FILE.touch(); core.mark_activity()
         _notify("agent input PAUSED"); print("paused"); return 0
     if c in ("resume", "toggle"):
-        core.PAUSE_FILE.unlink(missing_ok=True); _notify("agent input allowed"); print("resumed"); return 0
+        core.PAUSE_FILE.unlink(missing_ok=True); core.mark_activity(); _notify("agent input allowed"); print("resumed"); return 0
     if c == "build-helper":
         exe = core.CACHE / "bin" / "hypr-pointer"
         exe.unlink(missing_ok=True); print(core.helper_path()); return 0

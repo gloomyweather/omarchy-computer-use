@@ -10,7 +10,14 @@ OCR-based text targeting, window and workspace control.
   dispatch syntax (Hyprland ≥ 0.55, current Omarchy) and the legacy one.
 - **Model-friendly coordinates**: one stable "screen space" (screenshot pixels, 1280 px long edge by
   default) for every tool; HiDPI/fractional scaling and multi-monitor are mapped for you.
-- **Kill switch**: `omarchy-cu pause` (optionally bound to `SUPER+CTRL+ALT+P`) blocks all agent input.
+- **Omarchy-native**: ~400 `omarchy` system commands (themes, audio, display, toggles…), installed apps by
+  name, native popups (`ask_user`) and notifications to talk to the user.
+- **Semantic UI access**: AT-SPI accessibility tree (`ui_tree` / `ui_action`) for GTK/Qt/Chromium apps —
+  exact elements and actions without pixel guessing; OCR (two-pass, dark-theme aware) for everything else.
+- **"Claude is using your computer" indicator**: themed frame + pill while the agent acts, auto-hidden for
+  every capture so it never pollutes screenshots. Click the pill or press `SUPER+CTRL+ALT+P` to pause.
+- **Self-protection**: keyboard input into the agent's own terminal is refused (a stray `Escape` would
+  interrupt the agent itself).
 
 ## Install
 
@@ -77,6 +84,12 @@ omarchy-cu --help
 | `click`, `move_mouse`, `drag`, `scroll`, `mouse_button` | pointer (buttons, double/triple, modifier-click) |
 | `type_text`, `key` | Unicode typing (layout-independent), combos and sequences |
 | `windows`, `focus_window`, `close_window`, `workspace`, `launch` | Hyprland control |
+| `window` | float/tile/fullscreen/maximize, move to workspace, move/resize, swap, pin |
+| `ui_tree`, `ui_action` | accessibility tree → click/focus/set_text by element id |
+| `apps`, `launch app=…` | installed desktop apps, launched like the app launcher |
+| `omarchy`, `omarchy_commands` | the Omarchy command center |
+| `notify`, `ask_user` | talk to the user: notification, native pick-list / text popup |
+| `wait_for` | wait for text (OCR) or a window to appear / disappear |
 | `keybindings`, `clipboard`, `wait`, `hyprctl` | utilities |
 
 Action tools return a fresh screenshot by default (`screenshot: false` to skip).
@@ -89,6 +102,11 @@ Action tools return a fresh screenshot by default (`screenshot: false` to skip).
 | `OMARCHY_CU_AUTO_SCREENSHOT` | `1` | screenshot after actions |
 | `OMARCHY_CU_SETTLE` | `0.35` | seconds to wait before that screenshot |
 | `OMARCHY_CU_OCR_LANGS` | auto | e.g. `eng+rus` (install `tesseract-data-rus`) |
+| `OMARCHY_CU_INDICATOR` | `1` | on-screen "agent is using your computer" indicator |
+| `OMARCHY_CU_IDLE` | `20` | seconds of inactivity before the indicator hides |
+| `OMARCHY_CU_AGENT_NAME` | auto | name in the pill (`Claude` under Claude Code) |
+| `OMARCHY_CU_COLOR` | theme orange | indicator color |
+| `OMARCHY_CU_ALLOW_SELF` | `0` | allow keyboard input into the agent's own terminal |
 
 ## Layout
 
@@ -97,7 +115,8 @@ Action tools return a fresh screenshot by default (`screenshot: false` to skip).
 .mcp.json         MCP server registration (plugin)
 skills/           computer-use skill
 bin/omarchy-cu    launcher (CLI + `mcp` server)
-src/omarchy_cu/   core.py (capture/input/hyprland), server.py (MCP), cli.py
+src/omarchy_cu/   core.py (capture/input/hyprland/omarchy), a11y.py (AT-SPI), overlay.py (indicator),
+                  server.py (MCP), cli.py
 helper/           hypr-pointer.c (virtual pointer) + protocol XML + build.sh
 ```
 

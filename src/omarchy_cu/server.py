@@ -12,7 +12,7 @@ import threading
 import time
 import traceback
 
-from . import core
+from . import a11y, core
 from .core import CUError
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
@@ -98,10 +98,59 @@ TOOLS: list[dict] = [
     {"name": "workspace", "description": "Switch to a workspace: number, name, 'e+1', 'e-1', 'previous', 'special:scratchpad'.",
      "inputSchema": _obj({"target": _S, "screenshot": _SHOT}, ["target"])},
     {"name": "launch",
-     "description": "Launch an app via Hyprland exec (e.g. 'chromium https://example.com', 'nautilus', 'foot', "
-                    "'omarchy-launch-browser'). Waits for its window and focuses it.",
-     "inputSchema": _obj({"command": _S, "wait_seconds": {**_N, "description": "default 8; 0 = don't wait"},
-                          "screenshot": _SHOT}, ["command"])},
+     "description": "Start an app and wait for its window. Either `app` = installed app name / desktop id as in the "
+                    "launcher ('Files', 'Obsidian', 'Telegram') or `command` = shell command run via Hyprland "
+                    "('nautilus ~/Downloads', 'omarchy-launch-browser', 'foot -e htop').",
+     "inputSchema": _obj({"app": _S, "command": _S, "wait_seconds": {**_N, "description": "default 8; 0 = don't wait"},
+                          "screenshot": _SHOT})},
+    {"name": "ui_tree",
+     "description": "Accessibility tree (AT-SPI) of a window: visible interactive elements with id, role, name, "
+                    "states, actions, value and center coords (screen space). Exact and semantic — prefer it over "
+                    "OCR for GTK/GNOME apps (Files, Settings, …), Qt apps and Chromium/Electron started with "
+                    "accessibility on. Returns empty for apps that expose nothing.",
+     "inputSchema": _obj({"window": {**_S, "description": "selector; default = focused window"},
+                          "query": {**_S, "description": "filter by name/role substring"},
+                          "all_roles": {**_B, "description": "include non-interactive named elements (labels, headings)"},
+                          "limit": _I})},
+    {"name": "ui_action",
+     "description": "Act on a ui_tree element by id without moving the mouse: action 'click' (default action), "
+                    "'focus', 'set_text' (with text), or any action name the element lists. Re-run ui_tree if the id is stale.",
+     "inputSchema": _obj({"id": _S, "action": _S, "text": _S, "window": _S, "screenshot": _SHOT}, ["id"])},
+    {"name": "window",
+     "description": "Hyprland window management: action = focus | close | float | tile | toggle_float | fullscreen | "
+                    "maximize | move_to_workspace | send_to_workspace (stay here) | move (x,y) | resize (width,height) | "
+                    "swap / move_direction / focus_direction (direction) | pin. Sizes/positions in screen space. "
+                    "window = selector (default focused).",
+     "inputSchema": _obj({"action": _S, "window": _S, "workspace": _S, "x": _N, "y": _N, "width": _N, "height": _N,
+                          "direction": {"type": "string", "enum": ["left", "right", "up", "down"]},
+                          "screenshot": _SHOT}, ["action"])},
+    {"name": "apps",
+     "description": "Search installed desktop applications (name, desktop id). Launch one with launch(app=...).",
+     "inputSchema": _obj({"query": _S})},
+    {"name": "omarchy",
+     "description": "Run the Omarchy command center natively: `omarchy <args>` — e.g. 'theme list', 'theme set "
+                    "tokyo-night', 'font list', 'audio output volume +10', 'brightness display 60%', "
+                    "'toggle nightlight', 'screenshot'. Use omarchy_commands to discover commands. "
+                    "Never run [sudo] commands or 'update' without asking the user.",
+     "inputSchema": _obj({"args": _S}, ["args"])},
+    {"name": "omarchy_commands",
+     "description": "Search the Omarchy command catalog (~400 system commands: themes, fonts, audio, display, wifi, "
+                    "bluetooth, power, capture, toggles, menus). All words of the query must match.",
+     "inputSchema": _obj({"query": _S})},
+    {"name": "notify",
+     "description": "Show a desktop notification to the user (e.g. task finished, need attention).",
+     "inputSchema": _obj({"title": _S, "body": _S,
+                          "urgency": {"type": "string", "enum": ["low", "normal", "critical"]}}, ["title"])},
+    {"name": "ask_user",
+     "description": "Ask the user a question through a native Omarchy popup on their screen and wait for the answer: "
+                    "a pick list when options are given, free text otherwise. Use when the user is at the desktop "
+                    "rather than the terminal (e.g. confirm before an irreversible GUI action). Returns null if dismissed.",
+     "inputSchema": _obj({"question": _S, "options": {"type": "array", "items": _S},
+                          "timeout_seconds": _N}, ["question"])},
+    {"name": "wait_for",
+     "description": "Wait until text appears on screen (OCR) or a window (class/title) exists — or disappears with "
+                    "gone=true. Better than fixed sleeps for loading screens.",
+     "inputSchema": _obj({"text": _S, "window": _S, "gone": _B, "timeout_seconds": _N, "screenshot": _SHOT})},
     {"name": "keybindings",
      "description": "List the user's Hyprland keybindings (combo + description), optionally filtered "
                     "(e.g. 'browser', 'workspace', 'close'). Combos can be pressed with `key`.",
@@ -238,10 +287,61 @@ def call(name: str, a: dict) -> list[dict]:
         return _after(a, f"workspace {a['target']}")
 
     if name == "launch":
-        w = core.launch(a["command"], float(a.get("wait_seconds", 8)))
+        if a.get("app"):
+            w = core.launch_app(a["app"], float(a.get("wait_seconds", 8)))
+        elif a.get("command"):
+            w = core.launch(a["command"], float(a.get("wait_seconds", 8)))
+        else:
+            raise CUError("give app or command")
         msg = (f"launched; new window {w['address']} [{w['class']}] {w['title']!r} box={w['box']}" if w
                else "launched (no new window detected" + (")" if a.get("wait_seconds", 8) else ", not waiting)"))
         return _after(a, msg, settle=0.6)
+
+    if name == "ui_tree":
+        res = a11y.tree(a.get("window"), a.get("query", ""), not a.get("all_roles", False), int(a.get("limit", 250)))
+        lines = [f"window {res['window']['address']} [{res['window']['class']}] {res['window']['title']!r}"]
+        for e in res["elements"]:
+            extra = []
+            if e.get("states"): extra.append(",".join(e["states"]))
+            if e.get("value"): extra.append(f"value={e['value']!r}")
+            if e.get("actions"): extra.append("actions=" + "/".join(e["actions"]))
+            c = f"@({e['center'][0]},{e['center'][1]})" if e.get("center") else ""
+            lines.append(f"[{e['id']}] {e['role']} {e['name']!r} {c} {' '.join(extra)}".rstrip())
+        if res.get("note"):
+            lines.append(f"note: {res['note']}")
+        return [_txt("\n".join(lines))]
+
+    if name == "ui_action":
+        msg = a11y.act(a["id"], a.get("action", "click"), a.get("text"), a.get("window"))
+        return _after(a, msg)
+
+    if name == "window":
+        msg = core.window_action(a["action"], a.get("window"), a.get("workspace"), a.get("x"), a.get("y"),
+                                 a.get("width"), a.get("height"), a.get("direction"))
+        return _after(a, msg)
+
+    if name == "apps":
+        items = core.apps(a.get("query", ""))
+        return [_txt("\n".join(f"{i['name']}  ({i['id']})  {i['comment']}" for i in items[:150]) or "no apps match")]
+
+    if name == "omarchy":
+        return [_txt(core.omarchy(a["args"]))]
+
+    if name == "omarchy_commands":
+        items = core.omarchy_commands(a.get("query", ""))
+        return [_txt("\n".join(items[:200]) or "no commands match")]
+
+    if name == "notify":
+        core.notify(a["title"], a.get("body", ""), a.get("urgency", "normal"))
+        return [_txt("notified")]
+
+    if name == "ask_user":
+        ans = core.ask_user(a["question"], a.get("options"), float(a.get("timeout_seconds", 300)))
+        return [_txt(json.dumps({"answer": ans}, ensure_ascii=False))]
+
+    if name == "wait_for":
+        r = core.wait_for(a.get("text"), a.get("window"), a.get("gone", False), float(a.get("timeout_seconds", 15)))
+        return _after(a, json.dumps(r, ensure_ascii=False, default=str), settle=0)
 
     if name == "keybindings":
         return [_txt("\n".join(core.keybindings(a.get("filter", ""))) or "no matching bindings")]
