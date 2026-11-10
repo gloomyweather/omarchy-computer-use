@@ -31,6 +31,12 @@ claude plugin marketplace add ~/.local/share/omarchy-computer-use
 claude plugin install omarchy-computer-use@omarchy-computer-use
 ```
 
+## Browser
+
+For web pages, agents should prefer a DOM-level browser tool (Claude in Chrome, Playwright MCP, …) when one
+is connected. The skill tells Claude to fall back to pixel-level computer use only without one, or for
+things outside the page (OS file pickers, dialogs, other apps).
+
 ## Other agents
 
 Any MCP client: command `…/bin/omarchy-cu`, args `["mcp"]` (stdio).

@@ -1,6 +1,6 @@
 ---
 name: computer-use
-description: Operate the Omarchy / Hyprland Linux desktop like a human — take screenshots, click, type, press shortcuts, scroll, drag, read on-screen text (OCR), launch and focus apps, switch workspaces. Use whenever a task needs a GUI app, a web page in the real browser, visual verification of a running app, or anything not reachable from the shell. Triggers: "click", "open the app", "look at my screen", "what's on screen", "fill the form in the browser", "test the UI", "computer use", screenshot of the desktop.
+description: Operate the Omarchy / Hyprland Linux desktop like a human — take screenshots, click, type, press shortcuts, scroll, drag, read on-screen text (OCR), launch and focus apps, switch workspaces. Use whenever a task needs a native GUI app, visual verification of a running app, or anything not reachable from the shell. Triggers: "click", "open the app", "look at my screen", "what's on screen", "test the UI", "computer use", screenshot of the desktop. For web pages prefer Claude in Chrome when it is connected; use this only without a browser tool.
 ---
 
 # computer use on omarchy
@@ -39,8 +39,11 @@ Desktop control through the `computer` MCP server (tools `mcp__…computer__*`) 
 - Double / triple click: `click count=2|3`. Right-click menus: `button=right`. Modifier clicks:
   `modifiers=["ctrl"]`.
 - Scroll units are wheel notches; `dy>0` = down. Scroll with the cursor over the element that should scroll.
-- Browsers: `launch "omarchy-launch-browser"` or `launch "chromium --new-window https://…"`; then `ctrl+l`,
-  type the URL, `Return`. For heavy web automation a browser-specific tool may be better if available.
+- **Web pages: don't use this skill if a browser tool is available.** If Claude in Chrome
+  (`mcp__claude-in-chrome__*`) or another browser-automation MCP is connected, use it for anything inside
+  a web page — it reads the DOM and is faster and more reliable than pixels. Use computer use for the web
+  only when no browser tool is available, or for things outside the page (OS dialogs, file pickers,
+  extension popups, other apps). Then: `launch "omarchy-launch-browser"`, `ctrl+l`, type the URL, `Return`.
 - Hyprland specifics: windows tile; floating toggle / resize / move via `hyprctl` tool, e.g.
   `dispatch hl.dsp.window.float({ action = "toggle" })` (Omarchy uses the Lua dispatch syntax).
 - Small text: `zoom` on the region, or `find_text ""` with a `region` to dump all OCR lines there.
