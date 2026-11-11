@@ -1,4 +1,4 @@
-# ⌖ omarchy-computer-use
+# omarchy-computer-use
 
 computer use for ai agents on [omarchy](https://omarchy.org) and hyprland.
 
