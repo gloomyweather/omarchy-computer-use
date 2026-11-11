@@ -96,7 +96,7 @@ TOOLS: list[dict] = [
     {"name": "focus_window",
      "description": "Focus a window (switches workspace if needed). Selector: address '0x…', class, or title substring.",
      "inputSchema": _obj({"window": _S, "screenshot": _SHOT}, ["window"])},
-    {"name": "close_window", "description": "Close a window (selector as in focus_window) or the focused one.",
+    {"name": "close_window", "description": "Close a window (selector as in focus_window) or the focused one, and check that it closed. If the app asks first (\"Save changes?\"), it reports NOT closed with the dialog and a screenshot.",
      "inputSchema": _obj({"window": _S})},
     {"name": "workspace", "description": "Switch to a workspace: number, name, 'e+1', 'e-1', 'previous', 'special:scratchpad'.",
      "inputSchema": _obj({"target": _S, "screenshot": _SHOT}, ["target"])},
@@ -296,8 +296,9 @@ def call(name: str, a: dict) -> list[dict]:
         return _after(a, f"focused {w['address']} [{w['class']}] {w['title']!r}")
 
     if name == "close_window":
-        core.close_window(a.get("window"))
-        return [_txt("closed")]
+        r = core.close_window(a.get("window"))
+        # the screenshot matters when it did not close: it shows the "save changes?" dialog
+        return [_txt(core.close_report(r))] if r["closed"] else _after(a, core.close_report(r))
 
     if name == "workspace":
         core.workspace(a["target"])

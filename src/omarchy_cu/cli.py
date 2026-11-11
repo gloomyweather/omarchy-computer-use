@@ -207,7 +207,7 @@ def _run(a) -> int:
     if c == "focus":
         w = core.focus_window(a.window); print(w["address"], w["class"], w["title"]); return 0
     if c == "close":
-        core.close_window(a.window); return 0
+        r = core.close_window(a.window); print(core.close_report(r)); return 0 if r["closed"] else 1
     if c == "workspace":
         core.workspace(a.target); return 0
     if c == "launch":

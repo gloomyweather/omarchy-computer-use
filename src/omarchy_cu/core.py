@@ -554,19 +554,30 @@ def _ocr_words(png: bytes) -> tuple[list[tuple], int]:
         up = 2 if max(iw, ih) <= 2600 else 1
         a, b = Path(td) / "a.png", Path(td) / "b.png"
         try:
-            mean = float(run(["magick", str(src), "-colorspace", "gray", "-format", "%[fx:mean]", "info:"], timeout=20) or 0.5)
+            mean = float(run(["magick", str(src), "-alpha", "off", "-colorspace", "gray", "-format", "%[fx:mean]", "info:"], timeout=20) or 0.5)
         except ValueError:
             mean = 0.5
-        run(["magick", str(src), "-resize", f"{up * 100}%", str(a)], timeout=30)
-        run(["magick", str(src), "-colorspace", "gray", *(["-negate"] if mean < 0.5 else []),
+        run(["magick", str(src), "-alpha", "off", "-resize", f"{up * 100}%", str(a)], timeout=30)
+        # grim PNGs carry an alpha channel: with it, ImageMagick 7 thresholds/negates alpha too and pass B
+        # came out blank, so white-on-color text (e.g. a red "Don't Save" button) was never read
+        run(["magick", str(src), "-alpha", "off", "-colorspace", "gray", *(["-negate"] if mean < 0.5 else []),
              "-resize", f"{up * 100}%", "-threshold", "55%", str(b)], timeout=30)
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(2) as ex:
             wa, wb = ex.map(lambda p: _tess_words(p, langs), (a, b))
+    # merge: a B word is added where A has nothing. Where they overlap, A usually wins (better boxes), but
+    # A turns white-on-color labels (a red "Don't Save" button) into tiny garbage fragments, sometimes with
+    # high confidence: a B word replaces A words that cover less than half of its area, or that it reads
+    # with clearly more confidence.
     words = list(wa)
     for w in wb:
-        if all(_overlap(w, x) < 0.3 for x in words):
+        clash = [x for x in words if _overlap(w, x) >= 0.3]
+        if not clash:
             words.append(w)
+            continue
+        covered = sum(x[3] * x[4] for x in clash) / max(1, w[3] * w[4])
+        if (covered < 0.5 and w[5] >= 50) or w[5] >= max(x[5] for x in clash) + 15:
+            words = [x for x in words if x not in clash] + [w]
     return words, up
 
 
@@ -635,8 +646,12 @@ def ocr_lines(region: tuple[float, float, float, float] | None = None, monitor: 
     return hits
 
 
+_QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u02bc": "'", "`": "'", "\u201c": '"', "\u201d": '"', "\u201e": '"'})
+
+
 def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip().lower()
+    """Lowercase, collapse whitespace, and fold typographic quotes so "Don't" matches OCR's "Don’t"."""
+    return re.sub(r"\s+", " ", s.translate(_QUOTES)).strip().lower()
 
 
 def _span_hit(h: TextHit, ws: list, q: str, conf: float) -> TextHit:
@@ -1115,13 +1130,39 @@ def focus_window(selector: str) -> dict:
     return w
 
 
-def close_window(selector: str | None = None) -> None:
+def close_window(selector: str | None = None, wait: float = 2.0) -> dict:
+    """Ask a window to close and check that it did. Apps may refuse or ask first ("Save changes?"):
+    then closed=False and `dialogs` lists the windows that appeared (same app) meanwhile."""
     check_not_paused()
     if selector:
-        a = find_window(selector)["address"]
-        Hypr.dispatch(f'hl.dsp.window.close({{ window = "address:{a}" }})', f"closewindow address:{a}")
+        w = find_window(selector)
     else:
-        Hypr.dispatch("hl.dsp.window.close()", "killactive")
+        a = (Hypr.j("activewindow") or {}).get("address")
+        w = next((x for x in windows() if x["address"] == a), None)
+        if w is None:
+            raise CUError("no focused window to close")
+    a = w["address"]
+    before = {x["address"] for x in windows()}
+    Hypr.dispatch(f'hl.dsp.window.close({{ window = "address:{a}" }})', f"closewindow address:{a}")
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        time.sleep(0.15)
+        if all(x["address"] != a for x in windows()):
+            return {"closed": True, "window": w, "dialogs": []}
+    now = windows()
+    dialogs = [x for x in now if x["address"] not in before and (x["pid"] == w["pid"] or x["focused"])]
+    return {"closed": False, "window": w, "dialogs": dialogs}
+
+
+def close_report(r: dict) -> str:
+    w = r["window"]
+    name = f"{w['address']} [{w['class']}] {w['title'][:60]!r}"
+    if r["closed"]:
+        return f"closed {name}"
+    msg = f"NOT closed: {name} is still open"
+    if r["dialogs"]:
+        msg += "; it asked first: " + ", ".join(f"{d['address']} [{d['class']}] {d['title'][:60]!r}" for d in r["dialogs"])
+    return msg + " (answer the dialog, or the app refused)"
 
 
 def workspace(target: str) -> None:
@@ -1140,14 +1181,31 @@ def launch(command: str, wait_for_window: float = 8.0) -> dict | None:
     Hypr.dispatch(f"hl.dsp.exec_cmd({lua_str(cmd)})", f"exec {cmd}")
     if wait_for_window <= 0:
         return None
-    deadline = time.time() + wait_for_window
-    while time.time() < deadline:
+    return _wait_new_window(before, wait_for_window)
+
+
+def _wait_new_window(before: set, timeout: float) -> dict | None:
+    """The app's real window, not a splash: apps like LibreOffice first map a short-lived splash or a window
+    with an empty class that is renamed a moment later. A window that vanishes is skipped; one without a
+    class yet gets up to 3 more seconds to settle (it is still returned if it never does)."""
+    deadline = time.time() + timeout
+    settle_until = None
+    while time.time() < deadline or (settle_until and time.time() < settle_until):
         time.sleep(0.25)
-        new = [c for c in Hypr.j("clients") if c["address"] not in before and c.get("mapped", True)]
-        if new:
+        new = [w for w in windows() if w["address"] not in before]
+        if not new:
+            continue
+        good = [w for w in new if w["class"]]
+        if good:
             time.sleep(0.4)  # let it draw its first frame
-            addr = new[0]["address"]
-            return next((w for w in windows() if w["address"] == addr), None)
+            addr = good[-1]["address"]
+            w = next((w for w in windows() if w["address"] == addr), None)
+            if w:
+                return w
+            continue  # it was a splash after all
+        settle_until = settle_until or time.time() + 3
+        if time.time() >= settle_until:
+            return new[-1]
     return None
 
 
@@ -1336,7 +1394,7 @@ def window_action(action: str, window: str | None = None, workspace: str | None 
     elif act == "pin":
         Hypr.dispatch(f"hl.dsp.window.pin({{ {lw0} }})" if lw0 else "hl.dsp.window.pin()", f"pin {lg}".strip())
     elif act == "close":
-        close_window(window)
+        return close_report(close_window(window))
     elif act == "focus":
         focus_window(window or "")
     else:

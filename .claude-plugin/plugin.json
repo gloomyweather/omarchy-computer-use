@@ -1,6 +1,6 @@
 {
   "name": "omarchy-computer-use",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Computer use for Omarchy / Hyprland: screenshots, mouse, keyboard, OCR text targeting, window/workspace control. No root, no ydotool — native Wayland virtual pointer + wtype + grim.",
   "author": {
     "name": "gloomyweather",
