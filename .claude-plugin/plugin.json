@@ -6,13 +6,20 @@
     "name": "gloomyweather",
     "email": "228333338+gloomyweather@users.noreply.github.com"
   },
+  "homepage": "https://gloomyweather.github.io/#computer-use",
+  "repository": "https://github.com/gloomyweather/omarchy-computer-use",
   "keywords": [
+    "accessibility",
+    "ai-agents",
+    "claude-code",
     "computer-use",
-    "hyprland",
-    "omarchy",
-    "wayland",
     "desktop-automation",
-    "mcp"
+    "hyprland",
+    "linux",
+    "mcp",
+    "ocr",
+    "omarchy",
+    "wayland"
   ],
   "license": "MIT",
   "mcpServers": {
