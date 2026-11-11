@@ -56,8 +56,10 @@ def _app_for_window(Atspi, win: dict):
 
 
 def _frame_for_window(Atspi, app, win: dict):
-    """The app's top-level frame that corresponds to this Hyprland window (by title, then active)."""
-    title = win.get("title") or ""
+    """The app's top-level frame that corresponds to this Hyprland window: exact title, then a title
+    containment match, then the only frame, then the ACTIVE frame (only valid if this window is the
+    focused one). None if ambiguous: acting on another window's frame would be wrong."""
+    title = (win.get("title") or "").strip()
     frames = []
     for i in range(app.get_child_count()):
         try:
@@ -66,19 +68,32 @@ def _frame_for_window(Atspi, app, win: dict):
                 frames.append(f)
         except Exception:
             pass
-    for f in frames:
+
+    def name(f):
         try:
-            if title and (f.get_name() or "") == title:
-                return f
+            return (f.get_name() or "").strip()
         except Exception:
-            pass
-    for f in frames:
-        try:
-            if f.get_state_set().contains(Atspi.StateType.ACTIVE):
-                return f
-        except Exception:
-            pass
-    return frames[0] if frames else None
+            return ""
+    def active(cands):
+        if not win.get("focused"):
+            return None
+        for f in cands:
+            try:
+                if f.get_state_set().contains(Atspi.StateType.ACTIVE):
+                    return f
+            except Exception:
+                pass
+        return None
+    if len(frames) == 1:
+        return frames[0]
+    if title:
+        for cands in ([f for f in frames if name(f) == title],
+                      [f for f in frames if name(f) and (name(f) in title or title in name(f))]):
+            if len(cands) == 1:
+                return cands[0]
+            if len(cands) > 1:  # several windows with the same title: only the focused one is knowable
+                return active(cands)
+    return active(frames)
 
 
 def _states(Atspi, node) -> list[str]:
@@ -108,10 +123,12 @@ def tree(window: str | None = None, query: str = "", interactive_only: bool = Tr
     win = _resolve_window(window)
     app = _app_for_window(Atspi, win)
     if app is None:
-        return {"window": win, "elements": [], "note": "app exposes no accessibility tree (use OCR / screenshot)"}
+        return {"window": {k: win[k] for k in ("address", "class", "title", "box")}, "elements": [],
+                "note": "app exposes no accessibility tree (use OCR / screenshot)"}
     frame = _frame_for_window(Atspi, app, win)
     if frame is None:
-        return {"window": win, "elements": [], "note": "no accessible frame"}
+        return {"window": {k: win[k] for k in ("address", "class", "title", "box")}, "elements": [],
+                "note": "can't tell which of the app's windows this is; focus it (focus_window) and retry"}
     S = core.scale_factor()
     wx, wy = round(win["box"][0] / S), round(win["box"][1] / S)  # logical window origin
     q = query.lower().strip()
@@ -157,7 +174,8 @@ def tree(window: str | None = None, query: str = "", interactive_only: bool = Tr
                     actions = [ai.get_action_name(k) for k in range(ai.get_n_actions())]
             except Exception:
                 pass
-            item = {"id": f"e{len(out) + 1}", "path": ".".join(map(str, path)), "role": role, "name": name[:120]}
+            item = {"id": f"e{len(out) + 1}", "path": ".".join(map(str, path)), "role": role, "name": name[:120],
+                    "_sig": [role, name]}
             st = _states(Atspi, node)
             if st:
                 item["states"] = st
@@ -168,9 +186,11 @@ def tree(window: str | None = None, query: str = "", interactive_only: bool = Tr
                 item["center"] = [box[0] + box[2] // 2, box[1] + box[3] // 2]
             try:
                 if node.get_editable_text_iface() is not None or role in ("text", "entry", "password text"):
-                    ti = node.get_text_iface()
-                    if ti is not None and role != "password text":
-                        item["value"] = (ti.get_text(0, min(ti.get_character_count(), 200)) or "")
+                    # call through Atspi.Text explicitly: on the iface object `.get_text` resolves to the
+                    # deprecated 1-arg Atspi.Accessible.get_text and raises, so the value came back empty
+                    if node.get_text_iface() is not None and role != "password text":
+                        n = min(Atspi.Text.get_character_count(node), 200)
+                        item["value"] = Atspi.Text.get_text(node, 0, n) or ""
             except Exception:
                 pass
             out.append(item)
@@ -183,7 +203,7 @@ def tree(window: str | None = None, query: str = "", interactive_only: bool = Tr
                 walk(ch, path + [k], depth + 1)
 
     walk(frame, [fi if fi is not None else 0], 0)
-    _save_ids(win["address"], {e["id"]: e.pop("path") for e in out})
+    _save_ids(win["address"], {e["id"]: [e.pop("path"), *e.pop("_sig")] for e in out})
     res = {"window": {k: win[k] for k in ("address", "class", "title", "box")}, "elements": out}
     if len(out) >= limit:
         res["note"] = f"truncated at {limit} elements; pass query= to narrow"
@@ -204,35 +224,47 @@ def _save_ids(address: str, mapping: dict) -> None:
         pass
 
 
-def _path_for(eid: str, address: str) -> str:
+def _path_for(eid: str, address: str) -> tuple[str, list | None]:
+    """(child-index path, [role, name] recorded by ui_tree or None for a raw path id)."""
     import json
     if not eid.startswith("e"):
-        return eid  # raw child-index path
+        return eid, None  # raw child-index path
     try:
         data = json.loads(IDS_FILE.read_text())
     except (OSError, ValueError):
         raise CUError("no ui_tree cached; call ui_tree first")
     if data.get("address") != address:
         raise CUError("element ids belong to another window; call ui_tree for this window")
-    path = data["ids"].get(eid)
-    if not path:
+    rec = data["ids"].get(eid)
+    if not rec:
         raise CUError(f"unknown element {eid}; call ui_tree again")
-    return path
+    if isinstance(rec, str):
+        return rec, None
+    return rec[0], rec[1:]
 
 
 def _node_by_id(Atspi, win: dict, eid: str):
-    eid = _path_for(eid, win["address"])
+    path, sig = _path_for(eid, win["address"])
     app = _app_for_window(Atspi, win)
     if app is None:
         raise CUError("app exposes no accessibility tree")
     node = app
     try:
-        for part in eid.split("."):
+        for part in path.split("."):
             node = node.get_child_at_index(int(part))
             if node is None:
                 raise CUError(f"element {eid} no longer exists (UI changed); call ui_tree again")
     except ValueError:
         raise CUError(f"bad element id {eid!r}")
+    if sig is not None:
+        # the path is only a position; make sure the same element still sits there
+        try:
+            now = [node.get_role_name() or "", (node.get_name() or "").strip()]
+        except Exception:
+            now = None
+        if now != sig:
+            raise CUError(f"element {eid} changed since ui_tree (was {sig[0]} {sig[1]!r}, now "
+                          f"{(now or ['?', '?'])[0]} {(now or ['?', '?'])[1]!r}); call ui_tree again")
     return node
 
 
@@ -253,44 +285,69 @@ def _click_center(Atspi, node, win: dict, name: str) -> str:
     return f"clicked {name!r} at ({cx}, {cy}) (no AT-SPI action; used the pointer)"
 
 
+EDITABLE_ROLES = {"text", "entry", "password text", "search box", "spin button", "terminal", "editbar"}
+
+
+def _grab_focus(node) -> bool:
+    try:
+        comp = node.get_component_iface()
+        return bool(comp is not None and comp.grab_focus())
+    except Exception:  # GTK4 answers with an AT-SPI error instead of False
+        return False
+
+
 def act(eid: str, action: str = "click", text: str | None = None, window: str | None = None) -> str:
+    """Perform an action on an element from `tree`: click (default action), focus, set_text,
+    or any named action the element lists (e.g. 'activate', 'toggle', 'expand or contract')."""
     if window is None:
         import json
         try:  # default to the window the ids came from
             window = json.loads(IDS_FILE.read_text()).get("address")
         except (OSError, ValueError):
             window = None
-    """Perform an action on an element from `tree`: click (default action), focus, set_text,
-    or any named action the element lists (e.g. 'activate', 'toggle', 'expand or contract')."""
+    action = (action or "click").strip()
+    if action == "set_text" and text is None:
+        raise CUError("set_text needs text (use text=\"\" to clear the field)")
     core.check_not_paused()
     core.mark_activity()
     Atspi = _atspi()
     win = _resolve_window(window)
     node = _node_by_id(Atspi, win, eid)
     name = node.get_name() or node.get_role_name()
+    role = node.get_role_name() or ""
+    editable = role in EDITABLE_ROLES or node.get_editable_text_iface() is not None
     if action == "focus":
-        comp = node.get_component_iface()
-        if comp is None or not comp.grab_focus():
-            raise CUError("element can't take focus")
-        return f"focused {name!r}"
+        if _grab_focus(node):
+            return f"focused {name!r}"
+        if editable:  # clicking a text field only focuses it
+            return _click_center(Atspi, node, win, name) + " to focus it"
+        raise CUError(f"{name!r} can't take focus via AT-SPI (clicking it would activate it; use action=click "
+                      "if that's intended)")
     if action == "set_text":
         et = node.get_editable_text_iface()
         if et is None:
             raise CUError("element is not editable text")
-        if not et.set_text_contents(text or ""):
+        if not et.set_text_contents(text):
             raise CUError("app refused set_text")
         return f"set text of {name!r}"
+    if action == "click" and editable:
+        # an entry's default action is 'activate' = Enter (would submit the form): focus it instead,
+        # or click it with the pointer when it can't take focus
+        if _grab_focus(node):
+            return f"focused {name!r} ({role}; type_text to enter text, or ui_action set_text)"
+        return _click_center(Atspi, node, win, name) + " (text field: focused, not activated)"
     ai = node.get_action_iface()
     if ai is None or ai.get_n_actions() == 0:
         if action != "click":
             raise CUError(f"{name!r} exposes no actions")
         return _click_center(Atspi, node, win, name)
     names = [ai.get_action_name(k) for k in range(ai.get_n_actions())]
+    low = [n.lower().replace(" ", "") for n in names]
     if action == "click":
         pref = ("click", "press", "activate", "toggle", "jump", "open")
-        idx = next((names.index(p) for p in pref if p in names), 0)
-    elif action in names:
-        idx = names.index(action)
+        idx = next((low.index(p) for p in pref if p in low), 0)
+    elif action.lower().replace(" ", "") in low:
+        idx = low.index(action.lower().replace(" ", ""))
     else:
         raise CUError(f"{name!r} has actions {names}, not {action!r}")
     if not ai.do_action(idx):

@@ -27,7 +27,8 @@ cd ~/.local/share/omarchy-computer-use
 ./install.sh --keybind            # add --codex to also register with Codex CLI
 ```
 
-This installs missing packages (`grim wtype wl-clipboard tesseract base-devel …`), builds the pointer
+This installs missing packages (`grim wtype wl-clipboard tesseract tesseract-data-{eng,rus} base-devel …`;
+other OCR languages: `OMARCHY_CU_OCR_INSTALL="eng deu" ./install.sh`), builds the pointer
 helper, links `~/.local/bin/omarchy-cu`, and installs the Claude Code plugin (MCP server `computer` +
 `computer-use` skill) from the bundled local marketplace.
 
@@ -101,18 +102,20 @@ Action tools return a fresh screenshot by default (`screenshot: false` to skip).
 | `OMARCHY_CU_MAX_EDGE` | `1280` | long edge of screen space / screenshots |
 | `OMARCHY_CU_AUTO_SCREENSHOT` | `1` | screenshot after actions |
 | `OMARCHY_CU_SETTLE` | `0.35` | seconds to wait before that screenshot |
-| `OMARCHY_CU_OCR_LANGS` | auto | e.g. `eng+rus` (install `tesseract-data-rus`) |
+| `OMARCHY_CU_OCR_LANGS` | auto | all installed of eng/rus/ukr/deu/fra/spa, or e.g. `eng+rus` |
 | `OMARCHY_CU_INDICATOR` | `1` | on-screen "agent is using your computer" indicator |
 | `OMARCHY_CU_IDLE` | `20` | seconds of inactivity before the indicator hides |
 | `OMARCHY_CU_AGENT_NAME` | auto | name in the pill (`Claude` under Claude Code) |
 | `OMARCHY_CU_COLOR` | theme orange | indicator color |
 | `OMARCHY_CU_ALLOW_SELF` | `0` | allow keyboard input into the agent's own terminal |
+| `OMARCHY_CU_OWN_WINDOW` | auto | address of the agent's own window (for single-process terminals hosting many windows) |
+| `OMARCHY_CU_PYTHON` | `/usr/bin/python3` | interpreter for the CLI / MCP server (needs python-gobject) |
+| `OMARCHY_CU_PASTE_WAIT` | `0.6` | seconds before `via_clipboard` restores the previous clipboard |
 
 ## Layout
 
 ```
-.claude-plugin/   plugin.json, marketplace.json, icon
-.mcp.json         MCP server registration (plugin)
+.claude-plugin/   plugin.json (incl. the `computer` MCP server), marketplace.json
 skills/           computer-use skill
 bin/omarchy-cu    launcher (CLI + `mcp` server)
 src/omarchy_cu/   core.py (capture/input/hyprland/omarchy), a11y.py (AT-SPI), overlay.py (indicator),

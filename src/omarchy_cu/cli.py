@@ -129,7 +129,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("toggle", help="toggle pause (bind to a key)")
     sub.add_parser("build-helper", help="(re)build the pointer helper")
 
-    a = p.parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["hyprctl"]:  # pass everything through untouched (flags like -j included)
+        a = argparse.Namespace(cmd="hyprctl", args=argv[1:])
+    else:
+        a = p.parse_args(argv)
     try:
         return _run(a)
     except CUError as e:
@@ -167,7 +171,7 @@ def _run(a) -> int:
         reg = tuple(a.region) if a.region else None
         hits = core.find_text(a.query, reg, exact=a.exact) if a.query.strip() else core.ocr_lines(reg)
         if a.json:
-            print(json.dumps([h.__dict__ for h in hits], ensure_ascii=False))
+            print(json.dumps([h.public() for h in hits], ensure_ascii=False))
         else:
             for h in hits:
                 print(f"{h.x}\t{h.y}\t{h.text}")
@@ -218,7 +222,11 @@ def _run(a) -> int:
             core.set_clipboard(a.text)
         return 0
     if c == "hyprctl":
-        print(core.hyprctl(" ".join(a.args)), end=""); return 0
+        import shlex
+        # dispatch/eval take raw lua: join as typed; everything else must survive core's shlex.split
+        verb = next((x for x in a.args if not x.startswith("-")), "")
+        line = " ".join(a.args) if verb in ("dispatch", "eval") else shlex.join(a.args)
+        print(core.hyprctl(line), end=""); return 0
     if c == "wait":
         time.sleep(a.seconds); return 0
     if c == "ui":

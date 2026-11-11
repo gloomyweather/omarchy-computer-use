@@ -95,7 +95,8 @@ def main() -> int:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return 0  # already running
-    PIDFILE.write_text(str(os.getpid()))
+    # the pidfile is written only after the signal handlers are installed (below): a SIGUSR1 from a
+    # capturer before that would kill us with the default action
 
     import gi
     gi.require_version("Gtk", "4.0")
@@ -253,6 +254,7 @@ def main() -> int:
     sigadd(GLib.PRIORITY_HIGH, signal.SIGUSR1, on_hide)
     sigadd(GLib.PRIORITY_HIGH, signal.SIGUSR2, on_show)
     sigadd(GLib.PRIORITY_HIGH, signal.SIGTERM, lambda *_: (app.quit(), True)[1])
+    PIDFILE.write_text(str(os.getpid()))
     app.connect("activate", build)
     app.hold()
     try:

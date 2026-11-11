@@ -49,7 +49,9 @@ Use `wait_for text=… | window=…` instead of fixed sleeps for anything that l
 
 - **Never type into your own terminal.** Keyboard tools refuse when the agent's terminal is focused
   (it would interrupt you — e.g. `Escape` stops Claude Code). Focus/click the target window first.
-  `super+…` combos are allowed anywhere (they go to the compositor).
+  Exception: `super+…` combos that are plain compositor binds (launcher, workspaces, focus moves) are
+  allowed; binds that act on the focused window (close, universal copy/paste, …) are blocked there too.
+  `ui_action click` on a text field focuses it (it never presses Enter); stale `ui_tree` ids are refused.
 - Hyprland keybindings triggered with `key`: single-modifier `super+X` binds work; binds with several
   modifiers (`super+shift+…`, `super+ctrl+alt+…`) often don't fire from a virtual keyboard — use the
   native tools above instead (`launch`, `window`, `workspace`, `omarchy`). `keybindings filter=…` lists

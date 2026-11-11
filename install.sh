@@ -19,7 +19,10 @@ for pair in grim:grim wtype:wtype wl-copy:wl-clipboard tesseract:tesseract hyprc
             cc:base-devel wayland-scanner:wayland pkg-config:pkgconf python3:python; do
   command -v "${pair%%:*}" >/dev/null || need+=("${pair#*:}")
 done
-[[ -e /usr/share/tessdata/eng.traineddata ]] || need+=(tesseract-data-eng)
+# OCR languages: eng + rus by default; override with OMARCHY_CU_OCR_INSTALL="eng deu ..."
+for l in ${OMARCHY_CU_OCR_INSTALL:-eng rus}; do
+  [[ -e /usr/share/tessdata/$l.traineddata ]] || need+=("tesseract-data-$l")
+done
 if ((${#need[@]})); then
   say "installing: ${need[*]}"
   sudo pacman -S --needed --noconfirm "${need[@]}"
@@ -38,26 +41,52 @@ say "cli: ~/.local/bin/omarchy-cu"
 # 4. Claude Code plugin (local marketplace -> plugin)
 if ((claude)) && command -v claude >/dev/null; then
   say "installing Claude Code plugin"
-  claude plugin marketplace add "$here" 2>/dev/null || claude plugin marketplace update omarchy-computer-use || true
-  claude plugin install omarchy-computer-use@omarchy-computer-use || true
+  mp=omarchy-computer-use; id="omarchy-computer-use@$mp"
+  # a marketplace registered from another checkout would keep serving the old copy: re-point it
+  cur="$(claude plugin marketplace list --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    for m in json.load(sys.stdin):
+        if m.get("name") == sys.argv[1]:
+            print(m.get("path") or (m.get("source") or {}).get("path") or "")
+except Exception:
+    pass' "$mp" || true)"
+  if [[ -n $cur && $(readlink -f "$cur") != "$here" ]]; then
+    say "marketplace $mp pointed at $cur; re-registering from $here"
+    claude plugin marketplace remove "$mp" >/dev/null 2>&1 || true
+  fi
+  claude plugin marketplace add "$here" >/dev/null 2>&1 || claude plugin marketplace update "$mp" >/dev/null 2>&1 || true
+  # `install` is a no-op when already installed: `update` picks up a newer version on re-runs
+  claude plugin install "$id" >/dev/null 2>&1 || true
+  claude plugin update "$id" >/dev/null 2>&1 || true
+  say "restart Claude Code (or /mcp reconnect) to load the new version"
 fi
 
 # 5. Codex CLI
 if ((codex)) && command -v codex >/dev/null; then
   say "registering MCP server with codex"
   codex mcp remove computer >/dev/null 2>&1 || true
-  codex mcp add computer -- "$here/bin/omarchy-cu" mcp
+  codex mcp add computer -- "$here/bin/omarchy-cu" mcp || echo "warning: codex mcp add failed" >&2
 fi
 
 # 6. kill-switch keybinding
 if ((keybind)); then
-  f="$HOME/.config/hypr/bindings.lua"
-  if [[ -f "$f" ]] && ! grep -q "omarchy-cu toggle" "$f"; then
-    cp "$f" "$f.bak.omarchy-cu"
-    printf '\n-- Pause / resume agent computer use (omarchy-cu kill switch).\no.bind("SUPER + CTRL + ALT + P", "Pause agent computer use", "%s toggle")\n' \
-      "$HOME/.local/bin/omarchy-cu" >> "$f"
+  lua="$HOME/.config/hypr/bindings.lua" conf="$HOME/.config/hypr/bindings.conf"
+  cmd="$HOME/.local/bin/omarchy-cu toggle"
+  if grep -qs "omarchy-cu toggle" "$lua" "$conf"; then
+    say "kill switch already bound"
+  elif [[ -f $lua ]]; then
+    cp "$lua" "$lua.bak.omarchy-cu"
+    printf '\n-- Pause / resume agent computer use (omarchy-cu kill switch).\no.bind("SUPER + CTRL + ALT + P", "Pause agent computer use", "%s")\n' "$cmd" >> "$lua"
     hyprctl reload >/dev/null || true
     say "kill switch: SUPER+CTRL+ALT+P"
+  elif [[ -f $conf ]]; then
+    cp "$conf" "$conf.bak.omarchy-cu"
+    printf '\n# Pause / resume agent computer use (omarchy-cu kill switch).\nbindd = SUPER CTRL ALT, P, Pause agent computer use, exec, %s\n' "$cmd" >> "$conf"
+    hyprctl reload >/dev/null || true
+    say "kill switch: SUPER+CTRL+ALT+P"
+  else
+    echo "warning: no ~/.config/hypr/bindings.lua or bindings.conf; bind \`$cmd\` to a key yourself" >&2
   fi
 fi
 say "done. in Claude Code: /mcp should list 'computer'; or use the CLI: omarchy-cu --help"

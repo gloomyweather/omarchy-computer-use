@@ -46,7 +46,8 @@ TOOLS: list[dict] = [
      "inputSchema": _obj({"x": _N, "y": _N, "width": _N, "height": _N}, ["x", "y", "width", "height"])},
     {"name": "find_text",
      "description": "OCR the screen and return on-screen text matches with their center coordinates and boxes "
-                    "(screen space). Case-insensitive substring match, fuzzy fallback. Takes ~1-4 s. "
+                    "(screen space). Case-insensitive; best match first: the exact label, then whole-word, "
+                    "then substring matches (fuzzy fallback if none). Takes ~1-4 s. "
                     "Pass an empty query to list all text lines.",
      "inputSchema": _obj({"query": _S, "monitor": _S,
                           "region": {"type": "array", "items": _N, "minItems": 4, "maxItems": 4,
@@ -60,8 +61,10 @@ TOOLS: list[dict] = [
                           "screenshot": _SHOT})},
     {"name": "click_text",
      "description": "OCR the screen, find the given visible text and click its center. Fails if not found. "
-                    "`index` picks among several matches (top-to-bottom, left-to-right).",
-     "inputSchema": _obj({"text": _S, "index": _I, "exact": _B,
+                    "Matches are ranked as in find_text (exact label first); `index` picks among them "
+                    "(the reply lists them).",
+     "inputSchema": _obj({"text": _S, "index": _I,
+                          "exact": {**_B, "description": "only whole-word matches of the full text, no substring/fuzzy"},
                           "button": {"type": "string", "enum": ["left", "right", "middle"]},
                           "count": _I, "screenshot": _SHOT}, ["text"])},
     {"name": "move_mouse", "description": "Move the cursor to (x, y) (hover). " + COORD_NOTE,
@@ -177,12 +180,26 @@ def _txt(s: str) -> dict:
 
 
 def _after(args: dict, msg: str, settle: float = SETTLE) -> list[dict]:
+    """Result of an action that already happened: a failing follow-up screenshot must not turn it into
+    an error (the model would retry and e.g. type the text twice)."""
     content = [_txt(msg)]
     if args.get("screenshot", AUTO_SHOT):
-        time.sleep(settle)
-        content.append(_img(core.screenshot()))
-        content.append(_txt(core.desktop_summary()))
+        try:
+            time.sleep(settle)
+            shot = core.screenshot()
+            content += [_img(shot), _txt(core.desktop_summary())]
+        except Exception as e:  # noqa: BLE001
+            content.append(_txt(f"(action done; follow-up screenshot failed: {e})"))
     return content
+
+
+MAX_TEXT = 60_000
+
+
+def _cap(s: str) -> str:
+    if len(s) <= MAX_TEXT:
+        return s
+    return s[:MAX_TEXT] + f"\n... {len(s) - MAX_TEXT} more chars omitted; narrow the query"
 
 
 def _need_xy(a: dict) -> tuple:
@@ -325,7 +342,7 @@ def call(name: str, a: dict) -> list[dict]:
         return [_txt("\n".join(f"{i['name']}  ({i['id']})  {i['comment']}" for i in items[:150]) or "no apps match")]
 
     if name == "omarchy":
-        return [_txt(core.omarchy(a["args"]))]
+        return [_txt(_cap(core.omarchy(a["args"])))]
 
     if name == "omarchy_commands":
         items = core.omarchy_commands(a.get("query", ""))
@@ -350,16 +367,16 @@ def call(name: str, a: dict) -> list[dict]:
         if "text" in a:
             core.set_clipboard(a["text"])
             return [_txt(f"clipboard set ({len(a['text'])} chars)")]
-        return [_txt(core.get_clipboard())]
+        return [_txt(_cap(core.get_clipboard()) or "(clipboard is empty)")]
 
     if name == "wait":
         time.sleep(max(0.0, min(30.0, float(a.get("seconds", 1)))))
         return _after(a, f"waited {a.get('seconds', 1)}s", settle=0)
 
     if name == "hyprctl":
-        return [_txt(core.hyprctl(a["args"]) or "(empty)")]
+        return [_txt(_cap(core.hyprctl(a["args"]) or "(empty)"))]
 
-    raise CUError(f"unknown tool {name}")
+    raise CUError(f"unknown tool {name!r}")
 
 
 # ----------------------------------------------------------------------- jsonrpc
@@ -368,14 +385,36 @@ _out_lock = threading.Lock()
 
 
 def _send(msg: dict) -> None:
-    data = json.dumps(msg, ensure_ascii=False)
+    # ascii-only JSON: lone surrogates or odd bytes in tool output can never break the stream
+    data = json.dumps(msg, ensure_ascii=True)
     with _out_lock:
         sys.stdout.write(data + "\n")
         sys.stdout.flush()
 
 
+def _err(rid, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+
+
+def _call_tool(rid, params: dict) -> dict:
+    name = params.get("name", "")
+    args = params.get("arguments") or {}
+    if not isinstance(args, dict):
+        return _err(rid, -32602, "arguments must be an object")
+    try:
+        content = call(name, args)
+        return {"jsonrpc": "2.0", "id": rid, "result": {"content": content, "isError": False}}
+    except CUError as e:
+        return {"jsonrpc": "2.0", "id": rid, "result": {"content": [_txt(f"error: {e}")], "isError": True}}
+    except Exception as e:  # noqa: BLE001
+        tb = traceback.format_exc(limit=3)
+        return {"jsonrpc": "2.0", "id": rid, "result": {"content": [_txt(f"error: {e!r}\n{tb}")], "isError": True}}
+
+
 def _handle(req: dict) -> dict | None:
     method, rid, params = req.get("method"), req.get("id"), req.get("params") or {}
+    if not isinstance(params, dict):
+        return None if rid is None else _err(rid, -32602, "params must be an object")
     if rid is None:  # notification
         return None
     try:
@@ -384,7 +423,7 @@ def _handle(req: dict) -> dict | None:
             return {"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": v if v in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "omarchy-computer-use", "version": "0.1.0"},
+                "serverInfo": {"name": "omarchy-computer-use", "version": "0.2.0"},
                 "instructions": ("Desktop control for Omarchy/Hyprland. Start with `screenshot`. "
                                  "All coordinates are in the full-screenshot pixel space. Prefer `find_text`/"
                                  "`click_text` for text targets, `launch`/`focus_window`/`workspace` instead of "
@@ -395,26 +434,100 @@ def _handle(req: dict) -> dict | None:
         if method == "tools/list":
             return {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}
         if method == "tools/call":
-            name = params.get("name", "")
-            args = params.get("arguments") or {}
-            try:
-                content = call(name, args)
-                return {"jsonrpc": "2.0", "id": rid, "result": {"content": content, "isError": False}}
-            except CUError as e:
-                return {"jsonrpc": "2.0", "id": rid, "result": {"content": [_txt(f"error: {e}")], "isError": True}}
-            except Exception as e:  # noqa: BLE001
-                tb = traceback.format_exc(limit=3)
-                return {"jsonrpc": "2.0", "id": rid, "result": {"content": [_txt(f"error: {e!r}\n{tb}")], "isError": True}}
+            return _call_tool(rid, params)
         if method in ("resources/list", "prompts/list"):
             key = method.split("/")[0]
             return {"jsonrpc": "2.0", "id": rid, "result": {key: []}}
-        return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"method not found: {method}"}}
+        return _err(rid, -32601, f"method not found: {method}")
     except Exception as e:  # noqa: BLE001
-        return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": str(e)}}
+        return _err(rid, -32603, str(e))
+
+
+class _Worker:
+    """Runs tools/call requests one at a time (desktop input must not interleave) on a background
+    thread, so the reader keeps answering ping and handles notifications/cancelled meanwhile."""
+
+    def __init__(self):
+        import queue
+        self.q: "queue.Queue" = queue.Queue()
+        self.current = None
+        self.cancelled: set = set()
+        self.lock = threading.Lock()
+        self.t = threading.Thread(target=self._loop, daemon=True)
+        self.t.start()
+
+    def submit(self, req: dict) -> None:
+        self.q.put(req)
+
+    def cancel(self, rid) -> None:
+        with self.lock:
+            self.cancelled.add(rid)
+            if rid == self.current:
+                core.CANCEL.set()  # ask_user / wait_for return early
+
+    def _loop(self):
+        while True:
+            try:
+                if self._one() is False:
+                    return
+            except Exception as e:  # noqa: BLE001  the worker must survive anything
+                print(f"omarchy-cu mcp worker: {e!r}", file=sys.stderr)
+
+    def _one(self):
+        req = self.q.get()
+        if req is None:
+            return False
+        rid = req.get("id")
+        with self.lock:
+            if rid in self.cancelled:
+                self.cancelled.discard(rid)
+                return None
+            self.current = rid
+            core.CANCEL.clear()
+        try:
+            resp = _handle(req)
+        except Exception as e:  # noqa: BLE001
+            resp = _err(rid, -32603, str(e))
+        with self.lock:
+            self.current = None
+            dropped = rid in self.cancelled
+            self.cancelled.discard(rid)
+        if resp is not None and not dropped:  # no response to a cancelled request (MCP spec)
+            try:
+                _send(resp)
+            except Exception as e:  # noqa: BLE001  client gone: stop long waits, drop the rest
+                print(f"omarchy-cu mcp: send failed: {e!r}", file=sys.stderr)
+                core.CANCEL.set()
+
+    def close(self):
+        """stdin closed: finish what was already requested (the old loop did too), then exit."""
+        self.q.put(None)
+        self.t.join()
+
+
+def _dispatch(r, worker: _Worker) -> None:
+    if not isinstance(r, dict):
+        _send(_err(None, -32600, "invalid request"))
+        return
+    if r.get("method") == "notifications/cancelled":
+        p = r.get("params") if isinstance(r.get("params"), dict) else {}
+        if p.get("requestId") is not None:
+            worker.cancel(p["requestId"])
+        return
+    rid = r.get("id")
+    if rid is not None and (isinstance(rid, bool) or not isinstance(rid, (int, str))):
+        _send(_err(None, -32600, "invalid request: id must be a string or number"))
+        return
+    if r.get("method") == "tools/call" and rid is not None:
+        worker.submit(r)
+        return
+    resp = _handle(r)
+    if resp is not None:
+        _send(resp)
 
 
 def main() -> None:
-    # tools are executed serially: desktop input must not interleave
+    worker = _Worker()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -422,13 +535,14 @@ def main() -> None:
         try:
             req = json.loads(line)
         except json.JSONDecodeError:
-            _send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+            _send(_err(None, -32700, "parse error"))
             continue
-        reqs = req if isinstance(req, list) else [req]
-        for r in reqs:
-            resp = _handle(r)
-            if resp is not None:
-                _send(resp)
+        for r in (req if isinstance(req, list) else [req]):
+            try:
+                _dispatch(r, worker)
+            except Exception as e:  # noqa: BLE001  never let one bad message kill the server
+                print(f"omarchy-cu mcp: {e!r}", file=sys.stderr)
+    worker.close()
 
 
 if __name__ == "__main__":

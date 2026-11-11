@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
 # omarchy-cu — computer use for Omarchy/Hyprland. Works from a symlink too.
+# Uses the system python (it has python-gobject for AT-SPI / the indicator); a mise/pyenv/venv
+# python3 earlier on PATH would lack those modules. Override with OMARCHY_CU_PYTHON.
 src="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../src"
-exec env PYTHONPATH="$src${PYTHONPATH:+:$PYTHONPATH}" python3 -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from omarchy_cu.cli import main; sys.exit(main(sys.argv[1:]))' "$src" "$@"
+py="${OMARCHY_CU_PYTHON:-}"
+if [[ -z $py ]]; then
+  if [[ -x /usr/bin/python3 ]]; then py=/usr/bin/python3; else py=python3; fi
+fi
+exec "$py" -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from omarchy_cu.cli import main; sys.exit(main(sys.argv[1:]))' "$src" "$@"

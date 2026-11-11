@@ -1,8 +1,26 @@
 {
   "name": "omarchy-computer-use",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Computer use for Omarchy / Hyprland: screenshots, mouse, keyboard, OCR text targeting, window/workspace control. No root, no ydotool — native Wayland virtual pointer + wtype + grim.",
-  "author": { "name": "gloomyweather", "email": "228333338+gloomyweather@users.noreply.github.com" },
-  "keywords": ["computer-use", "hyprland", "omarchy", "wayland", "desktop-automation", "mcp"],
-  "license": "MIT"
+  "author": {
+    "name": "gloomyweather",
+    "email": "228333338+gloomyweather@users.noreply.github.com"
+  },
+  "keywords": [
+    "computer-use",
+    "hyprland",
+    "omarchy",
+    "wayland",
+    "desktop-automation",
+    "mcp"
+  ],
+  "license": "MIT",
+  "mcpServers": {
+    "computer": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/omarchy-cu",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
 }

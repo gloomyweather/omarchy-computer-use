@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "computer": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/omarchy-cu",
-      "args": ["mcp"]
-    }
-  }
-}

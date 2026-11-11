@@ -11,6 +11,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,12 @@
 
 static struct wl_seat *seat;
 static struct zwlr_virtual_pointer_manager_v1 *mgr;
+static volatile sig_atomic_t stop;
+static int held[16], nheld; /* buttons currently pressed by us: released on any exit path */
+
+static void on_signal(int s) { (void)s; stop = 1; }
+static void hold(int b) { for (int i = 0; i < nheld; i++) if (held[i] == b) return; if (nheld < 16) held[nheld++] = b; }
+static void unhold(int b) { for (int i = 0; i < nheld; i++) if (held[i] == b) { held[i] = held[--nheld]; return; } }
 
 static void reg_global(void *d, struct wl_registry *r, uint32_t name, const char *iface, uint32_t ver) {
     (void)d;
@@ -48,7 +55,7 @@ static int button_code(const char *s) {
     if (!strcasecmp(s, "back") || !strcasecmp(s, "side")) return 0x113;
     if (!strcasecmp(s, "forward") || !strcasecmp(s, "extra")) return 0x114;
     char *e; long v = strtol(s, &e, 0);
-    if (*e || v <= 0) { fprintf(stderr, "bad button: %s\n", s); exit(2); }
+    if (*e || v <= 0) { fprintf(stderr, "bad button: %s\n", s); return -1; }
     return (int)v;
 }
 
@@ -75,12 +82,18 @@ int main(int argc, char **argv) {
     wl_registry_add_listener(reg, &reg_listener, NULL);
     wl_display_roundtrip(dpy);
     if (!mgr) { fprintf(stderr, "compositor lacks zwlr_virtual_pointer_manager_v1\n"); return 1; }
+    struct sigaction sa = { .sa_handler = on_signal };
+    sigaction(SIGTERM, &sa, NULL); sigaction(SIGINT, &sa, NULL); sigaction(SIGHUP, &sa, NULL);
     struct zwlr_virtual_pointer_v1 *p = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(mgr, seat);
-    wl_display_roundtrip(dpy);
     int rc = 0;
+    /* a protocol error (or a dead compositor connection) must fail the command, not report success */
+#define RT() do { if (wl_display_roundtrip(dpy) < 0) { \
+        fprintf(stderr, "wayland error: %s\n", strerror(wl_display_get_error(dpy))); rc = 1; goto out; } } while (0)
+    RT();
 
     for (int i = 1; i < argc; i++) {
         const char *c = argv[i];
+        if (stop) { fprintf(stderr, "interrupted\n"); rc = 1; goto out; }
 #define NEED(n) do { if (i + (n) >= argc) { fprintf(stderr, "%s: missing args\n", c); rc = 2; goto out; } } while (0)
         if (!strcmp(c, "move")) {
             NEED(2);
@@ -95,22 +108,27 @@ int main(int argc, char **argv) {
             /* zero-length motion so pointer focus/hover is recomputed for our seat device */
             zwlr_virtual_pointer_v1_motion(p, now_ms(), wl_fixed_from_int(0), wl_fixed_from_int(0));
             zwlr_virtual_pointer_v1_frame(p);
-            wl_display_roundtrip(dpy);
+            RT();
             i += 2;
         } else if (!strcmp(c, "down") || !strcmp(c, "up")) {
             NEED(1);
-            zwlr_virtual_pointer_v1_button(p, now_ms(), button_code(argv[i + 1]), c[0] == 'd' ? 1 : 0);
+            int b = button_code(argv[i + 1]);
+            if (b < 0) { rc = 2; goto out; }
+            zwlr_virtual_pointer_v1_button(p, now_ms(), b, c[0] == 'd' ? 1 : 0);
             zwlr_virtual_pointer_v1_frame(p);
-            wl_display_roundtrip(dpy);
+            if (c[0] == 'd') hold(b); else unhold(b);
+            RT();
             i += 1;
         } else if (!strcmp(c, "click")) {
             NEED(1);
             int b = button_code(argv[i + 1]); int n = 1;
+            if (b < 0) { rc = 2; goto out; }
             if (i + 2 < argc) { char *e; long v = strtol(argv[i + 2], &e, 10); if (!*e && v > 0) { n = (int)v; i++; } }
             for (int k = 0; k < n; k++) {
-                zwlr_virtual_pointer_v1_button(p, now_ms(), b, 1); zwlr_virtual_pointer_v1_frame(p); wl_display_roundtrip(dpy);
+                if (stop) { rc = 1; goto out; }
+                zwlr_virtual_pointer_v1_button(p, now_ms(), b, 1); zwlr_virtual_pointer_v1_frame(p); hold(b); RT();
                 msleep(15);
-                zwlr_virtual_pointer_v1_button(p, now_ms(), b, 0); zwlr_virtual_pointer_v1_frame(p); wl_display_roundtrip(dpy);
+                zwlr_virtual_pointer_v1_button(p, now_ms(), b, 0); zwlr_virtual_pointer_v1_frame(p); unhold(b); RT();
                 if (k + 1 < n) msleep(60);
             }
             i += 1;
@@ -123,10 +141,11 @@ int main(int argc, char **argv) {
                 int n = axes[a]; if (!n) continue;
                 int step = n > 0 ? 1 : -1;
                 for (int k = 0; k != n; k += step) {
+                    if (stop) { rc = 1; goto out; }
                     zwlr_virtual_pointer_v1_axis_source(p, 0 /* wheel */);
                     zwlr_virtual_pointer_v1_axis_discrete(p, now_ms(), a, wl_fixed_from_int(15 * step), step);
                     zwlr_virtual_pointer_v1_frame(p);
-                    wl_display_roundtrip(dpy);
+                    RT();
                     msleep(20);
                 }
             }
@@ -137,7 +156,7 @@ int main(int argc, char **argv) {
             if (d) zwlr_virtual_pointer_v1_axis_discrete(p, now_ms(), ax, wl_fixed_from_double(v), d);
             else zwlr_virtual_pointer_v1_axis(p, now_ms(), ax, wl_fixed_from_double(v));
             zwlr_virtual_pointer_v1_frame(p);
-            wl_display_roundtrip(dpy);
+            RT();
             i += 3;
         } else if (!strcmp(c, "sleep")) {
             NEED(1); msleep(atol(argv[i + 1])); i += 1;
@@ -146,6 +165,12 @@ int main(int argc, char **argv) {
         }
     }
 out:
+    /* on failure / signal never leave a button stuck down; on success a trailing `down` is intentional
+     * (mouse_button down ... up in separate calls) and stays pressed */
+    for (int k = 0; (rc || stop) && k < nheld; k++) {
+        zwlr_virtual_pointer_v1_button(p, now_ms(), held[k], 0);
+        zwlr_virtual_pointer_v1_frame(p);
+    }
     zwlr_virtual_pointer_v1_destroy(p);
     wl_display_roundtrip(dpy);
     wl_display_disconnect(dpy);
